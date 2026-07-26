@@ -1,0 +1,16 @@
+[Unit]
+Description=Ovalino Live realtime NDOV listener
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/ovalino-live
+ExecStart=/opt/ovalino-live/venv/bin/python /opt/ovalino-live/ovalino_live.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

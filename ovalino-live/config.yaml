@@ -1,0 +1,23 @@
+general:
+  listen_host: 0.0.0.0
+  listen_port: 8000
+  data_retention_seconds: 900
+  snapshot_path: ./ovalino_live_snapshot.json
+
+zero_mq:
+  # Voor busdata gebruiken we alleen Qbuzz en EBS op poort 7817.
+  bison_url: tcp://pubsub.besteffort.ndovloket.nl:7817
+  info_plus_url: tcp://pubsub.besteffort.ndovloket.nl:7664
+  bison_subscriptions:
+    - /GOVI/KV8passtimes/QBUZZ
+    - /GOVI/KV8passtimes/EBS
+  infoplus_subscriptions:
+    - /RIG/InfoPlus
+
+wordpress:
+  enabled: false
+  # Optioneel voor een toekomstige push-integratie naar WordPress.
+  # In de huidige WordPress-plugin gebruiken we geen push-URL; WP haalt zelf data op via het live REST endpoint.
+  push_url: ''
+  push_token: ''
+  timeout_seconds: 10

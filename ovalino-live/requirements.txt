@@ -1,0 +1,5 @@
+fastapi>=0.111.0
+uvicorn[standard]>=0.23.0
+pyzmq>=25.0.0
+lxml>=4.9.0
+PyYAML>=6.0
