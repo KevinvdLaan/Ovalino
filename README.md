@@ -1,6 +1,6 @@
 # Ovalino Plugin Suite
 
-The **Ovalino Plugin Suite** is a modular collection of WordPress plugins and Python daemons designed to integrate real-time and scheduled public transit data (Dutch OV / GTFS-RT / NDOV - licensing at GOVI is required to use these datasets) into WordPress websites.
+The **Ovalino Plugin Suite** is a Dutch modular collection of WordPress plugins and Python daemons designed to integrate real-time and scheduled public transit data (Dutch OV / GTFS-RT / NDOV - licensing at GOVI is required to use these datasets) into WordPress websites.
 
 ---
 
@@ -27,6 +27,10 @@ The **Ovalino Plugin Suite** is a modular collection of WordPress plugins and Py
 5. **`ov-halte-importer`**
    * **Purpose:** Imports and synchronizes transit stop locations and metadata into the WordPress database. Includes a companion Python script (`ov-realtime-daemon.py`) for background processing.
    * **Type:** WordPress Plugin & Python Daemon
+
+OV Halte Importer and OV Trein Dienstregeling are the basic modules, always needed to import bus and train-planned departure data. Ovalino Map, OV Reisplanner and the Ovalino Live-service with the OV Realtime Python daemon (external API needed because live data from GOVI/NDOV-Loket is being delivered in ZeroMQ which is not always supported on shared webhosting) are optional modules, but depend on the OV Halte Importer and OV Trein Dienstregeling to function.
+
+The obtaining of a license from the NDOV Loket/GOVI is needed to access and use the different public datasets and can be registered at https://govi.nu.
 
 ---
 
