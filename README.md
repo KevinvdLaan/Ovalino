@@ -1,3 +1,5 @@
+<img width="2359" height="761" alt="ovalinologo" src="https://github.com/user-attachments/assets/85c291fc-89a2-46ee-8ebb-40fec4328372" />
+
 # Ovalino Plugin Suite
 
 The **Ovalino Plugin Suite** is a Dutch modular collection of WordPress plugins and Python daemons designed to integrate real-time and scheduled public transit data (Dutch OV / GTFS-RT / NDOV - licensing at GOVI is required to use these datasets) into WordPress websites.
