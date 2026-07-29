@@ -36,6 +36,41 @@ var config = window.ovrepMapConfig || {};
 var ajaxUrl = config.ajaxUrl || '/wp-admin/admin-ajax.php';
 var scheduleBaseUrl = config.scheduleBaseUrl || '/';
 
+function getServiceDate() {
+    try {
+        var now = new Date();
+        var parts = new Intl.DateTimeFormat('en-GB', {
+            timeZone: 'Europe/Amsterdam',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            hour12: false
+        }).formatToParts(now);
+
+        var year = '', month = '', day = '', hour = 0;
+        for (var i = 0; i < parts.length; i++) {
+            if (parts[i].type === 'year') year = parts[i].value;
+            if (parts[i].type === 'month') month = parts[i].value;
+            if (parts[i].type === 'day') day = parts[i].value;
+            if (parts[i].type === 'hour') hour = parseInt(parts[i].value, 10);
+        }
+
+        var d = new Date(Date.UTC(parseInt(year, 10), parseInt(month, 10) - 1, parseInt(day, 10)));
+        if (hour < 4) {
+            d.setUTCDate(d.getUTCDate() - 1);
+        }
+
+        var resYear = d.getUTCFullYear();
+        var resMonth = String(d.getUTCMonth() + 1).padStart(2, '0');
+        var resDay = String(d.getUTCDate()).padStart(2, '0');
+
+        return resYear + '-' + resMonth + '-' + resDay;
+    } catch (e) {
+        return config.currentServiceDate || new Date().toISOString().split('T')[0];
+    }
+}
+
 function initMap() {
     var mapContainer = document.getElementById('ovrp-map');
     if (!mapContainer) {
@@ -76,49 +111,7 @@ function initMap() {
 
     onMapChange();
 
-    // Geolocation: Bied gebruikers de mogelijkheid hun huidige locatie te gebruiken
     if (navigator.geolocation) {
-        L.Control.extend({
-            includes: L.Mixin.Events,
-            options: {
-                position: 'topleft',
-                strings: {
-                    title: 'Toon mijn locatie'
-                }
-            },
-            onAdd: function (map) {
-                var className = 'leaflet-control-locate',
-                    container = L.DomUtil.create('div', className + ' leaflet-bar leaflet-control');
-
-                var link = L.DomUtil.create('a', className + '-button', container);
-                link.href = '#';
-                link.title = this.options.strings.title;
-                link.innerHTML = '📍';
-                link.style.fontSize = '18px';
-                link.style.display = 'flex';
-                link.style.alignItems = 'center';
-                link.style.justifyContent = 'center';
-                link.style.width = '36px';
-                link.style.height = '36px';
-                link.style.color = '#861121';
-                link.style.textDecoration = 'none';
-
-                L.DomEvent.on(link, 'click', L.DomEvent.preventDefault);
-                L.DomEvent.on(link, 'click', function() {
-                    navigator.geolocation.getCurrentPosition(function(position) {
-                        var lat = position.coords.latitude;
-                        var lon = position.coords.longitude;
-                        map.setView([lat, lon], 14);
-                        L.marker([lat, lon]).addTo(map).bindPopup('Uw huidige locatie').openPopup();
-                    }, function(error) {
-                        alert('Locatie kon niet worden bepaald: ' + error.message);
-                    });
-                });
-
-                return container;
-            }
-        });
-
         var locateControl = new (L.Control.extend({
             includes: L.Mixin.Events,
             options: {
@@ -189,7 +182,7 @@ function renderStops(stops) {
     var hiddenLines = window.ovrepMapConfig.hiddenLines || [];
 
     stops.forEach(function(stop) {
-        var hasVisibleLine = (stop.type === 'train');
+        var hasVisibleLine = false;
         if (stop.lines && stop.lines.length > 0) {
             for (var i = 0; i < stop.lines.length; i++) {
                 var lineRef = stop.lines[i].lineRef;
@@ -206,13 +199,11 @@ function renderStops(stops) {
 
         var key = stop.type + '_' + stop.code;
         if (markerStore[key]) {
-            // FIX: Update de popup met de nieuwste binnengehaalde vertrektijden
             markerStore[key].bindPopup(createPopupContent(stop));
-            
             newMarkerStore[key] = markerStore[key];
             delete markerStore[key];
         } else {
-            var marker = (currentZoom >= 13) ? createDetailedMarker(stop) : createSimpleMarker(stop);
+            var marker = (currentZoom >= 13 && stop.type !== 'train') ? createDetailedMarker(stop) : createSimpleMarker(stop);
             if (marker) {
                 newMarkerStore[key] = marker;
                 toAdd.push(marker);
@@ -250,7 +241,7 @@ function createDetailedMarker(stop) {
     var color = '#861121';
 
     var marker = L.circleMarker([stop.lat, stop.lon], {
-        radius: stop.type === 'train' ? 10 : 7,
+        radius: 7,
         fillColor: color,
         color: '#fff',
         weight: 2,
@@ -271,12 +262,10 @@ function createDetailedMarker(stop) {
 function createPopupContent(stop) {
     var platformVal = '';
     
-    // stop.platform bevat nu al "Perron: B5" (met prefix)
     if (stop.platform) {
         platformVal = stop.platform.toString().trim();
     }
 
-    // Perron HTML nu direkt onder de haltenaam
     var platformHtml = '';
     if (platformVal) {
         platformHtml = '<div style="color:#707070 !important; font-size:12px !important; margin-top:2px !important; margin-bottom:8px !important; font-family:\'Helvetica Neue\',Helvetica,Arial,sans-serif !important; font-weight:500 !important; display:block !important;">' + escapeHtml(platformVal) + '</div>';
@@ -284,7 +273,6 @@ function createPopupContent(stop) {
 
     var lineMap = {};
     
-    // Verwerk lijnen die direct aan de halte gekoppeld zijn
     (stop.lines || []).forEach(function(line) {
         var nameStr = (line.name || '').trim();
         if (nameStr) {
@@ -298,7 +286,6 @@ function createPopupContent(stop) {
         }
     });
 
-    // Verwerk lijnen uit de ritten / vertrektijden (zorgt dat missende lijnen altijd getoond worden)
     (stop.departures || []).forEach(function(dep) {
         var nameStr = (dep.line || '').trim();
         if (nameStr && !lineMap[nameStr]) {
@@ -318,7 +305,8 @@ function createPopupContent(stop) {
         return (a.name || '').localeCompare(b.name || '', undefined, { numeric: true, sensitivity: 'base' });
     });
 
-    // Gekleurde line badges
+    var serviceDate = getServiceDate();
+
     var lineBadges = sortedLines.length > 0
         ? sortedLines.map(function(line) {
             var label = escapeHtml(line.name || '');
@@ -338,9 +326,10 @@ function createPopupContent(stop) {
             }
 
             var ref = line.lineRef || line.name || '';
-            var today = new Date().toISOString().split('T')[0];
             var direction = line.direction || 'outbound';
-            var url = scheduleBaseUrl + '/dienstregeling/?ovld_direction=' + encodeURIComponent(direction) + '&ovld_line=' + encodeURIComponent(ref) + '&ovld_variant=' + today;
+            var lineBaseUrl = config.lineScheduleUrl || (scheduleBaseUrl + 'dienstregeling/');
+            var sep = lineBaseUrl.indexOf('?') !== -1 ? '&' : '?';
+            var url = lineBaseUrl + sep + 'ovld_direction=' + encodeURIComponent(direction) + '&ovld_line=' + encodeURIComponent(ref) + '&ovld_variant=' + serviceDate;
 
             var finalFg = fg;
             if (fg === '#ffffff' || fg === '#fff') {
@@ -361,21 +350,9 @@ function createPopupContent(stop) {
         }).join('')
         : '';
 
-    var linesHtml = lineBadges
+    var linesHtml = (stop.type !== 'train' && lineBadges)
         ? '<div style="margin-top:8px;font-size:12px;line-height:1.4;"><strong>Lijnen:</strong><div style="margin-top:4px;">' + lineBadges + '</div></div>'
         : '';
-
-    var trainsHtml = '';
-    if (stop.type === 'train' && stop.trains && stop.trains.length > 0) {
-        var sortedTrains = stop.trains.slice().sort(function(a, b) {
-            return (a.label || '').localeCompare(b.label || '', undefined, { numeric: true });
-        });
-        var trainItems = sortedTrains.map(function(train) {
-            var url = scheduleBaseUrl + '/treindienstregeling/?direction=' + encodeURIComponent(train.ref);
-            return '<div style="margin-top:4px;"><a href="' + escapeHtml(url) + '" target="_blank" style="color:#861121;text-decoration:none;font-weight:bold;font-size:12px;">🚆 ' + escapeHtml(train.label) + '</a></div>';
-        }).join('');
-        trainsHtml = '<div style="margin-top:10px;font-size:12px;line-height:1.4;"><strong>Treinen op dit station:</strong>' + trainItems + '</div>';
-    }
 
     var departuresHtml = '';
     function formatDepartureTime(dep) {
@@ -401,11 +378,14 @@ function createPopupContent(stop) {
             var url = '';
 
             if (stop.type === 'bus' && dep.lineRef) {
-                var today = new Date().toISOString().split('T')[0];
                 var direction = dep.direction || 'outbound';
-                url = scheduleBaseUrl + '/dienstregeling/?ovld_direction=' + encodeURIComponent(direction) + '&ovld_line=' + encodeURIComponent(dep.lineRef) + '&ovld_variant=' + today;
+                var busBaseUrl = config.lineScheduleUrl || (scheduleBaseUrl + 'dienstregeling/');
+                var sepBus = busBaseUrl.indexOf('?') !== -1 ? '&' : '?';
+                url = busBaseUrl + sepBus + 'ovld_direction=' + encodeURIComponent(direction) + '&ovld_line=' + encodeURIComponent(dep.lineRef) + '&ovld_variant=' + serviceDate;
             } else if (stop.type === 'train' && dep.direction) {
-                url = scheduleBaseUrl + '/treindienstregeling/?direction=' + encodeURIComponent(dep.direction);
+                var trainBaseUrl = config.trainScheduleUrl || (scheduleBaseUrl + 'treindienstregeling/');
+                var sepTrain = trainBaseUrl.indexOf('?') !== -1 ? '&' : '?';
+                url = trainBaseUrl + sepTrain + 'direction=' + encodeURIComponent(dep.direction) + '&ovtd_direction=' + encodeURIComponent(dep.direction) + '&ovtd_variant=' + serviceDate;
             }
 
             if (url) {
@@ -428,7 +408,6 @@ function createPopupContent(stop) {
             '<strong style="color:#861121;font-size:14px;font-family:\'circularstd-bold\', sans-serif;display:block;margin-bottom:2px;">' + escapeHtml(stop.name) + '</strong>' +
             platformHtml +
             linesHtml +
-            trainsHtml +
             departuresHtml +
             departuresUrlHtml +
             '</div>';

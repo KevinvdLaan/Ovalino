@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Ovalino Map
  * Description: Interactieve kaart met alle haltes en treinstations voor Ovalino.
- * Version: 1.1.1
+ * Version: 1.2.0
  * Author: Kevin van der Laan
  * License: GPL-2.0-or-later
  * Requires Plugins: ov-halte-importer, ov-trein-dienstregeling
@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) {
 }
 
 class Ovalino_Map {
-	const VERSION = '1.1.1';
+	const VERSION = '1.2.0';
 	const FRONTEND_STYLE = 'ovalino-map-style';
 	const FRONTEND_SCRIPT = 'ovalino-map-script';
 
@@ -160,7 +160,7 @@ class Ovalino_Map {
 		$west  = isset($_GET['west'])  ? (float) $_GET['west']  : 0;
 		$zoom  = isset($_GET['zoom'])  ? (int) $_GET['zoom']    : 9;
  
-		$cache_key = 'ovmap_stops_v11_' . md5($north . $south . $east . $west . $zoom);
+		$cache_key = 'ovmap_stops_v12_' . md5($north . $south . $east . $west . $zoom);
 		$cached_results = get_transient($cache_key);
 		if ($cached_results !== false) {
 			wp_send_json_success($cached_results);
@@ -288,7 +288,7 @@ class Ovalino_Map {
 
 		// 2. Train Stations
 		if ($wpdb->get_var("SHOW TABLES LIKE '" . self::table('ovtd', 'stations') . "'")) {
-			$stations_cache_key = 'ovmap_stations_wgs84';
+			$stations_cache_key = 'ovmap_stations_wgs84_v2';
 			$stations_wgs84 = get_transient($stations_cache_key);
 
 			if ($stations_wgs84 === false) {
@@ -316,6 +316,42 @@ class Ovalino_Map {
 					$directions = self::get_train_directions($s['code']);
 					if (empty($directions)) continue;
 
+					// Bushaltes tonen alleen het lijnnummer in de bol, want dat
+					// is al uniek genoeg. Treinen zonder eigen lijnnummer
+					// (nu nog bijna alle NS-treinen) delen dezelfde korte
+					// code (IC/Sto/Snl) voor meerdere bestemmingen — daarom
+					// zetten we de bestemming in dat geval in de bol zelf
+					// ("IC richting Veendam"), zodat het niet lijkt op één
+					// echte lijn. Heeft de richting wél een lijncode (bv.
+					// "RE1"), dan staat alleen die code in de bol, net als
+					// bij bussen.
+					$train_lines = array();
+					foreach ($directions as $direction) {
+						$badge = isset($direction['badge']) ? trim((string) $direction['badge']) : '';
+						$line_code = isset($direction['line_code']) ? trim((string) $direction['line_code']) : '';
+						$destination = isset($direction['label']) ? trim((string) $direction['label']) : '';
+
+						if ($badge === '') {
+							continue;
+						}
+
+						$pill_label = ($line_code !== '' || $destination === '')
+							? $badge
+							: $badge . ' richting ' . $destination;
+
+						if (isset($train_lines[$pill_label])) {
+							continue;
+						}
+
+						$train_lines[$pill_label] = array(
+							'name'       => $pill_label,
+							'colour'     => '#861121',
+							'textColour' => '#ffffff',
+							'lineRef'    => (string) $direction['ref'],
+							'direction'  => 'outbound',
+						);
+					}
+
 					$departures = isset($train_departures_by_station[$s['code']]) ? $train_departures_by_station[$s['code']] : array();
 					$station_code = strtolower($s['code']);
 					$departures_url = isset($link_map['station'][$station_code]) ? $link_map['station'][$station_code] : '';
@@ -326,9 +362,9 @@ class Ovalino_Map {
 						'lon'   => $s['lon'],
 						'name'  => $s['name'],
 						'code'  => $s['code'],
-						'trains' => $directions,
+						'lines' => array_values($train_lines),
 						'platform' => '',
-						'departures' => $departures, 
+						'departures' => $departures,
 						'departures_url' => $departures_url,
 					);
 				}
@@ -767,7 +803,7 @@ class Ovalino_Map {
 
 		$sql = "
 			SELECT so.station_code,
-			       j.train_number as line, d.destination_name as destination, so.departure_seconds as dep_sec, j.direction_ref,
+			       d.train_type, d.line_code, d.destination_name as destination, so.departure_seconds as dep_sec, j.direction_ref,
 			       rd.delay_seconds, rd.is_cancelled
 			FROM " . self::table('ovtd', 'journey_stops') . " so
 			INNER JOIN " . self::table('ovtd', 'journeys') . " j ON j.journey_ref = so.journey_ref
@@ -806,8 +842,13 @@ class Ovalino_Map {
 				$timezone = wp_timezone();
 				$dt = new DateTimeImmutable('@' . $ts);
 				$dt = $dt->setTimezone($timezone);
+				// Zelfde lijnaanduiding als de "Lijnen:"-badges op dit station:
+				// lijncode indien bekend, anders het afgekorte treintype.
+				$line_badge = class_exists('OV_Trein_Dienstregeling')
+					? OV_Trein_Dienstregeling::get_line_badge($row['train_type'], $row['line_code'])
+					: (string) $row['train_type'];
 				$departures_by_station[$station_code][] = array(
-					'line' => $row['line'],
+					'line' => $line_badge,
 					'destination' => $row['destination'],
 					'time' => $dt->format('H:i'),
 					'delay_seconds' => isset($row['delay_seconds']) ? (int) $row['delay_seconds'] : 0,
@@ -854,21 +895,85 @@ class Ovalino_Map {
 	private static function get_train_directions($station_code) {
 		global $wpdb;
 		$sql = "
-			SELECT DISTINCT d.direction_ref as ref, d.destination_name as label
+			SELECT DISTINCT d.direction_ref as ref, d.destination_name as label, d.train_type, d.line_code
 			FROM " . self::table('ovtd', 'journey_stops') . " js
 			INNER JOIN " . self::table('ovtd', 'journeys') . " j ON j.journey_ref = js.journey_ref
 			INNER JOIN " . self::table('ovtd', 'directions') . " d ON d.direction_ref = j.direction_ref
 			WHERE js.station_code = %s
 		";
-		return $wpdb->get_results($wpdb->prepare($sql, $station_code), ARRAY_A);
+		$rows = $wpdb->get_results($wpdb->prepare($sql, $station_code), ARRAY_A);
+
+		// Bepaal per richting de lijnbadge op dezelfde manier als OV Trein
+		// Dienstregeling: lijncode (bv. "RSx") indien bekend, anders het
+		// afgekorte treintype (IC/Spr/Snl/etc). Zo tonen we op de kaart
+		// straks dezelfde lijnaanduiding als in de dienstregeling zelf.
+		foreach ($rows as &$row) {
+			$row['badge'] = class_exists('OV_Trein_Dienstregeling')
+				? OV_Trein_Dienstregeling::get_line_badge($row['train_type'], $row['line_code'])
+				: (string) $row['train_type'];
+		}
+		unset($row);
+
+		return $rows;
 	}
 
+	/**
+	 * Nauwkeurige RD (Rijksdriehoek) -> WGS84 conversie.
+	 *
+	 * De eerder gebruikte lineaire benadering week tientallen kilometers af
+	 * van de werkelijke locatie. Dit is de gangbare polynomiale
+	 * RD-benadering (nauwkeurig tot op ~1 meter), zodat stations ook binnen
+	 * een strak ingezoomd kaartgebied op de juiste plek terechtkomen.
+	 */
 	private static function rd_to_wgs84($x, $y) {
-		$X = $x - 155000;
-		$Y = $y - 463000;
+		$x0 = 155000.0;
+		$y0 = 463000.0;
+		$phi0 = 52.15517440;
+		$lam0 = 5.38720621;
 
-		$lat = 52.3675 + ($Y / 111111);
-		$lon = 5.3870 + ($X / (111111 * cos(deg2rad(52.3675))));
+		// [macht van dX, macht van dY, coëfficiënt]
+		$k = array(
+			array(0, 1, 3235.65389),
+			array(2, 0, -32.58297),
+			array(0, 2, -0.24750),
+			array(2, 1, -0.84978),
+			array(0, 3, -0.06550),
+			array(2, 2, -0.01709),
+			array(1, 0, -0.00738),
+			array(4, 0, 0.00530),
+			array(2, 3, -0.00039),
+			array(4, 1, 0.00033),
+			array(1, 1, -0.00012),
+		);
+		$l = array(
+			array(1, 0, 5260.52916),
+			array(1, 1, 105.94684),
+			array(1, 2, 2.45656),
+			array(3, 0, -0.81885),
+			array(1, 3, 0.05594),
+			array(3, 1, -0.05607),
+			array(0, 1, 0.01199),
+			array(3, 2, -0.00256),
+			array(1, 4, 0.00128),
+			array(0, 2, 0.00022),
+			array(2, 0, -0.00022),
+			array(5, 0, 0.00026),
+		);
+
+		$dx = ($x - $x0) * 0.00001;
+		$dy = ($y - $y0) * 0.00001;
+
+		$sum_phi = 0.0;
+		foreach ($k as $term) {
+			$sum_phi += $term[2] * pow($dx, $term[0]) * pow($dy, $term[1]);
+		}
+		$sum_lam = 0.0;
+		foreach ($l as $term) {
+			$sum_lam += $term[2] * pow($dx, $term[0]) * pow($dy, $term[1]);
+		}
+
+		$lat = $phi0 + ($sum_phi / 3600);
+		$lon = $lam0 + ($sum_lam / 3600);
 
 		return array('lat' => $lat, 'lon' => $lon);
 	}
