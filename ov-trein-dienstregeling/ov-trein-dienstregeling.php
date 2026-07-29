@@ -2,7 +2,7 @@
 /**
  * Plugin Name: OV Trein Dienstregeling
  * Description: Toon treindienstregelingen voor ritten die minimaal één keer in Groningen of Drenthe stoppen, op basis van de NS IFF-dataset.
- * Version: 1.0.6
+ * Version: 1.0.7
  * Author: Kevin van der Laan
  * License: GPL-2.0-or-later
  */
@@ -12,7 +12,7 @@ if (!defined('ABSPATH')) {
 }
 
 class OV_Trein_Dienstregeling {
-	const VERSION = '1.0.6';
+	const VERSION = '1.0.7';
 	const OPTION_IMPORT_INFO = 'ovtd_import_info';
 	const OPTION_HIDDEN_DIRECTIONS = 'ovtd_hidden_directions';
 	const OPTION_IMPORT_STATE = 'ovtd_import_state';
@@ -94,6 +94,7 @@ class OV_Trein_Dienstregeling {
 			series_key varchar(40) NOT NULL default '',
 			direction_bucket varchar(10) NOT NULL default '',
 			train_type varchar(80) NOT NULL default '',
+			line_code varchar(20) NOT NULL default '',
 			departure_name varchar(255) NOT NULL default '',
 			destination_name varchar(255) NOT NULL default '',
 			operator_code varchar(10) NOT NULL default '',
@@ -142,8 +143,16 @@ class OV_Trein_Dienstregeling {
 		foreach ($sql as $statement) {
 			dbDelta($statement);
 		}
-	}
 
+		// Migraties (bv. nieuwe kolommen op bestaande tabellen) hingen voorheen
+		// alleen af van de activation hook, die niet opnieuw vuurt als de
+		// plugin-bestanden simpelweg worden overschreven zonder de plugin te
+		// deactiveren/activeren. Door dit hier ook te doen, herstelt het
+		// tabelschema zichzelf zodra create_tables() ergens wordt aangeroepen
+		// (o.a. bij elk bezoek aan de beheerpagina).
+		self::migrate_tables();
+	}
+	
 	private static function migrate_tables() {
 		global $wpdb;
 
@@ -172,6 +181,19 @@ class OV_Trein_Dienstregeling {
 
 		if (!in_array('attributes', $column_names_journeys, true)) {
 			$wpdb->query("ALTER TABLE $table_journeys ADD COLUMN attributes varchar(255) NOT NULL default '' AFTER footnote_ref");
+		}
+
+		// Add line_code column to the directions table if it doesn't exist yet.
+		// This carries the regional-operator line number (e.g. "RSx") that IFF
+		// already delivers for Arriva/Blauwnet/etc, and which NS is expected
+		// to start delivering the same way from December. Once populated it
+		// is used in place of the generic train type in the direction label.
+		$table_directions = self::table('directions');
+		$columns_directions = $wpdb->get_results("DESCRIBE $table_directions");
+		$column_names_directions = wp_list_pluck($columns_directions, 'Field');
+
+		if (!in_array('line_code', $column_names_directions, true)) {
+			$wpdb->query("ALTER TABLE $table_directions ADD COLUMN line_code varchar(20) NOT NULL default '' AFTER train_type");
 		}
 	}
 
@@ -835,8 +857,15 @@ class OV_Trein_Dienstregeling {
 			'station_code' => $code,
 			'station_name' => $name,
 			'country' => isset($parts[4]) ? trim($parts[4]) : '',
-			'x' => isset($parts[7]) ? (int) $parts[7] : 0,
-			'y' => isset($parts[8]) ? (int) $parts[8] : 0,
+			// IFF stations.dat levert x/y afgerond op 10 meter (één cijfer
+			// wordt ingeslikt), dus vermenigvuldigen met 10 om terug te
+			// komen op echte RD-meters. Zonder deze correctie belanden alle
+			// stations ~10x te dicht bij het RD-nulpunt (155000,463000),
+			// wat ze in de praktijk ergens in Noord-Frankrijk plaatst in
+			// plaats van in Nederland — daardoor vielen ze altijd buiten elk
+			// realistisch kaartgebied.
+			'x' => isset($parts[7]) ? ((int) $parts[7]) * 10 : 0,
+			'y' => isset($parts[8]) ? ((int) $parts[8]) * 10 : 0,
 		);
 	}
 
@@ -1432,12 +1461,31 @@ class OV_Trein_Dienstregeling {
 			'series_key' => $series_key,
 			'direction_bucket' => $direction_bucket,
 			'train_type' => (string) $train_type,
+			'line_code' => (string) $line_code,
 			'departure_name' => $departure_name,
 			'destination_name' => $destination_name,
 			'operator_code' => (string) $company_code,
 			'operator_name' => (string) $operator_name,
-			'label' => trim($train_type . ' ' . $departure_name . ' richting ' . $destination_name . ' - ' . $operator_name),
+			'label' => self::format_direction_label($train_type, $line_code, $departure_name, $destination_name, $operator_name),
 		);
+	}
+
+	/**
+	 * Build the human-readable direction label.
+	 *
+	 * When a line code is known (currently regional operators like Arriva
+	 * and Blauwnet via IFF; NS is expected to start delivering this the same
+	 * way from December) it replaces the generic train type word in the
+	 * text, e.g. "RSx richting Veendam - Arriva" instead of
+	 * "Sneltrein richting Veendam - Arriva". The round badge elsewhere in
+	 * the UI keeps showing the abbreviated train type code (Sto/Snl/IC) via
+	 * train_badge() regardless of this, since that is derived from
+	 * train_type directly and is untouched by the line code.
+	 */
+	private static function format_direction_label($train_type, $line_code, $departure_name, $destination_name, $operator_name) {
+		$line_code = strtoupper(trim((string) $line_code));
+		$type_label = $line_code !== '' ? $line_code : (string) $train_type;
+		return trim($type_label . ' ' . $departure_name . ' richting ' . $destination_name . ' - ' . $operator_name);
 	}
 
 	private static function direction_grouping_key($company_code, $series_key, $direction_bucket) {
@@ -1723,13 +1771,14 @@ class OV_Trein_Dienstregeling {
 			$destination_label = self::compact_station_name(implode('/', $destination_names));
 			$direction['departure_name'] = implode('/', $departure_names);
 			$direction['destination_name'] = implode('/', $destination_names);
-			$direction['label'] = trim($train_type . ' ' . $departure_label . ' richting ' . $destination_label . ' - ' . $operator_name);
+			$direction['label'] = self::format_direction_label($train_type, $line_code, $departure_label, $destination_label, $operator_name);
 			$sort_key = 0;
 			$insert_rows[] = array(
 				'direction_ref' => $direction_ref,
 				'series_key' => $direction['series_key'],
 				'direction_bucket' => $direction['direction_bucket'],
 				'train_type' => $direction['train_type'],
+				'line_code' => $line_code,
 				'departure_name' => $direction['departure_name'],
 				'destination_name' => $direction['destination_name'],
 				'operator_code' => $direction['operator_code'],
@@ -1748,6 +1797,7 @@ class OV_Trein_Dienstregeling {
 					'series_key' => $row['series_key'],
 					'direction_bucket' => $row['direction_bucket'],
 					'train_type' => $row['train_type'],
+					'line_code' => $row['line_code'],
 					'departure_name' => $row['departure_name'],
 					'destination_name' => $row['destination_name'],
 					'operator_code' => $row['operator_code'],
@@ -1755,7 +1805,7 @@ class OV_Trein_Dienstregeling {
 					'label' => $row['label'],
 					'sort_key' => (int) $row['sort_key'],
 				),
-				array('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d')
+				array('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d')
 			);
 		}
 	}
@@ -1908,7 +1958,7 @@ class OV_Trein_Dienstregeling {
 			$wpdb->prepare(
 				'
 				SELECT j.journey_ref, j.train_number, j.direction_ref, j.footnote_ref, js.departure_seconds, js.arrival_seconds, js.stop_order, jm.max_stop_order,
-					d.train_type, d.destination_name, d.label
+					d.train_type, d.line_code, d.destination_name, d.label
 				FROM ' . self::table('journey_stops') . ' js
 				INNER JOIN ' . self::table('journeys') . ' j ON j.journey_ref = js.journey_ref
 				INNER JOIN (
@@ -2069,6 +2119,7 @@ class OV_Trein_Dienstregeling {
 		foreach ($processed_candidates as $cand) {
 			$row = $cand['row'];
 			$train_type = !empty($row['train_type']) ? (string) $row['train_type'] : 'Trein';
+			$line_code = !empty($row['line_code']) ? strtoupper(trim((string) $row['line_code'])) : '';
 			$destination_name = !empty($row['destination_name']) ? (string) $row['destination_name'] : '';
 
 			$time_str = $cand['scheduled_time']->format('H:i');
@@ -2085,7 +2136,7 @@ class OV_Trein_Dienstregeling {
 				'public_code' => self::train_badge($train_type),
 				'colour' => self::FALLBACK_COLOR,
 				'text_colour' => self::resolve_text_colour(self::FALLBACK_COLOR, ''),
-				'destination' => $destination_name !== '' ? 'richting ' . $destination_name : 'Trein',
+				'destination' => $destination_name !== '' ? trim(($line_code !== '' ? $line_code . ' ' : '') . 'richting ' . $destination_name) : 'Trein',
 				'departures' => array($time_str),
 				'schedule_url' => self::build_schedule_url_for_direction(
 					isset($row['direction_ref']) ? (string) $row['direction_ref'] : '',
@@ -2697,6 +2748,22 @@ class OV_Trein_Dienstregeling {
 			'Sneltrein' => 'Snl',
 		);
 		return isset($map[$train_type]) ? $map[$train_type] : mb_substr($train_type, 0, 3);
+		
+	}
+
+	/**
+	 * Public wrapper so other Ovalino plugins (e.g. Ovalino Map) can build a
+	 * "line badge" for a train direction the same way this plugin does: the
+	 * line code when known (regional operators via IFF today; NS is expected
+	 * to start delivering this the same way from December), otherwise the
+	 * abbreviated train type (IC/Spr/Snl/etc).
+	 */
+	public static function get_line_badge($train_type, $line_code = '') {
+		$line_code = strtoupper(trim((string) $line_code));
+		if ($line_code !== '') {
+			return $line_code;
+		}
+		return self::train_badge((string) $train_type);
 	}
 
 	private static function get_merged_stops(array $journeys) {
