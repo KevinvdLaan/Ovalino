@@ -931,49 +931,92 @@ class Ovalino_Map {
 		// 3. Voeg eventuele extra stops toe uit realtime_delays
 		if ((bool) $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $realtime_table))) {
 			$one_hour_ago = date('Y-m-d H:i:s', $now - 3600);
+			$st_list = array();
+			foreach ($station_codes as $sc) {
+				$sc_clean = strtolower(trim($sc));
+				$sc_clean = preg_replace('/^nl:[sq]:/', '', $sc_clean);
+				$st_list[] = $sc_clean;
+				$st_list[] = strtoupper($sc_clean);
+				$st_list[] = 'nl:s:' . $sc_clean;
+				$st_list[] = 'nl:q:' . $sc_clean;
+			}
+			$st_list = array_values(array_unique(array_filter($st_list)));
+			$st_placeholders = implode(',', array_fill(0, count($st_list), '%s'));
 			$extra_rows = $wpdb->get_results(
-				$wpdb->prepare("SELECT journey_ref, stop_code, delay_seconds, is_cancelled, departure_time, destination, train_type, line_code FROM $realtime_table WHERE stop_code IN ($placeholders) AND (is_extra_stop = 1 OR departure_time <> '') AND updated_at >= %s", ...array_merge($params, array($one_hour_ago))),
+				$wpdb->prepare("SELECT journey_ref, stop_code, delay_seconds, is_cancelled, departure_time, destination, train_type, line_code FROM $realtime_table WHERE LOWER(stop_code) IN ($st_placeholders) AND is_cancelled = 0 AND updated_at >= %s", ...array_merge($st_list, array($one_hour_ago))),
 				ARRAY_A
 			);
 			if (!empty($extra_rows)) {
 				foreach ($extra_rows as $erow) {
-					$st_code = strtolower(trim((string)$erow['stop_code']));
+					$raw_scode = strtolower(trim((string)$erow['stop_code']));
+					$st_code = preg_replace('/^nl:[sq]:/', '', $raw_scode);
 					$ejref = trim((string)$erow['journey_ref']);
-					if (isset($seen_train_keys[$st_code . '|' . $ejref]) || isset($seen_train_keys[$st_code . '|' . ltrim($ejref, '0')])) {
+					$clean_ejref = ltrim($ejref, '0');
+
+					if (isset($seen_train_keys[$st_code . '|' . $ejref]) || isset($seen_train_keys[$st_code . '|' . $clean_ejref])) {
 						continue;
 					}
-					if (empty($erow['departure_time'])) {
-						continue;
-					}
-					$ts = strtotime($erow['departure_time']);
-					if (!$ts) {
-						$timezone = wp_timezone();
-						$dt_cand = DateTimeImmutable::createFromFormat('H:i', substr($erow['departure_time'], 0, 5), $timezone);
-						if ($dt_cand) {
-							$ts = $dt_cand->getTimestamp();
+
+					$ts = 0;
+					if (!empty($erow['departure_time'])) {
+						$ts = strtotime($erow['departure_time']);
+						if (!$ts) {
+							$timezone = wp_timezone();
+							$dt_cand = DateTimeImmutable::createFromFormat('H:i', substr($erow['departure_time'], 0, 5), $timezone);
+							if ($dt_cand) {
+								$ts = $dt_cand->getTimestamp();
+							}
 						}
 					}
-					if ($ts && $ts >= $now && $ts <= $two_hours_later) {
+					if (!$ts) {
+						$ts = $now;
+					}
+
+					if ($ts >= $now - 600 && $ts <= $two_hours_later) {
 						$timezone = wp_timezone();
 						$dt = new DateTimeImmutable('@' . $ts);
 						$dt = $dt->setTimezone($timezone);
+
+						$train_type = !empty($erow['train_type']) ? $erow['train_type'] : '';
+						$line_code = !empty($erow['line_code']) ? $erow['line_code'] : '';
+						$dest_name = !empty($erow['destination']) ? $erow['destination'] : '';
+						$dir_ref = $ejref;
+
+						if ($train_type === '' || $dest_name === '') {
+							$static_info = $wpdb->get_row(
+								$wpdb->prepare(
+									"SELECT d.train_type, d.line_code, d.destination_name, j.direction_ref FROM " . self::table('ovtd', 'journeys') . " j INNER JOIN " . self::table('ovtd', 'directions') . " d ON d.direction_ref = j.direction_ref WHERE j.journey_ref = %s OR j.journey_ref = %s OR j.train_number = %s OR j.train_number = %s LIMIT 1",
+									$ejref, $clean_ejref, $ejref, $clean_ejref
+								),
+								ARRAY_A
+							);
+							if ($static_info) {
+								if ($train_type === '') $train_type = $static_info['train_type'];
+								if ($line_code === '') $line_code = $static_info['line_code'];
+								if ($dest_name === '') $dest_name = $static_info['destination_name'];
+								$dir_ref = $static_info['direction_ref'];
+							}
+						}
+
 						$line_badge = class_exists('OV_Trein_Dienstregeling')
-							? OV_Trein_Dienstregeling::get_line_badge($erow['train_type'], $erow['line_code'])
-							: (!empty($erow['train_type']) ? $erow['train_type'] : 'Trein');
+							? OV_Trein_Dienstregeling::get_line_badge($train_type !== '' ? $train_type : 'Trein', $line_code)
+							: ($train_type !== '' ? $train_type : 'Trein');
 
 						if (!isset($departures_by_station[$st_code])) {
 							$departures_by_station[$st_code] = array();
 						}
 						$departures_by_station[$st_code][] = array(
 							'line' => $line_badge,
-							'destination' => !empty($erow['destination']) ? $erow['destination'] : 'Trein',
+							'destination' => $dest_name !== '' ? $dest_name : 'Trein',
 							'time' => $dt->format('H:i') . ' (extra stop)',
 							'delay_seconds' => (int)$erow['delay_seconds'],
 							'is_cancelled' => !empty($erow['is_cancelled']),
-							'lineRef' => $ejref,
-							'direction' => $ejref,
+							'lineRef' => $dir_ref,
+							'direction' => $dir_ref,
 							'timestamp' => $ts
 						);
+						$seen_train_keys[$st_code . '|' . $ejref] = true;
+						$seen_train_keys[$st_code . '|' . $clean_ejref] = true;
 					}
 				}
 			}

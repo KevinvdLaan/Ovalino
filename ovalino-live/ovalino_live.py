@@ -202,14 +202,17 @@ def parse_infoplus_message(raw_bytes: bytes, envelope: str) -> List[DelayRecord]
     now_iso = datetime.now(timezone.utc).isoformat()
 
     journey_ref = None
-    stop_code = ""
-    delay_seconds = 0
-    is_cancelled = False
-    departure_time = ""
-    destination = ""
-    train_type = ""
-    line_code = ""
-    is_extra_stop = False
+    for element in root.iter():
+        tag = strip_namespace(element.tag)
+        value = (element.text or '').strip()
+        if tag in ('treinnummer', 'logischeritnummer', 'ritnummer', 'ritid', 'trainid', 'journeyref') and value:
+            journey_ref = value
+            if journey_ref.isdigit():
+                journey_ref = str(int(journey_ref))
+            break
+
+    if not journey_ref:
+        return records
 
     delay_tags = (
         'exactevertrekvertraging', 'exacteaankomstvertraging',
@@ -218,54 +221,108 @@ def parse_infoplus_message(raw_bytes: bytes, envelope: str) -> List[DelayRecord]
         'vertrekvertraging', 'aankomstvertraging', 'vertraging', 'delay'
     )
 
-    for element in root.iter():
-        tag = strip_namespace(element.tag)
-        value = (element.text or '').strip()
-        if not value:
-            continue
-        if tag in ('treinnummer', 'logischeritnummer', 'ritnummer', 'ritid', 'trainid', 'journeyref') and not journey_ref:
-            journey_ref = value.strip()
-            if journey_ref.isdigit():
-                journey_ref = str(int(journey_ref))
-        elif tag in ('stationcode', 'stopcode', 'haltecode') and not stop_code:
-            stop_code = value.lower()
-        elif tag in delay_tags:
-            parsed_d = parse_iso_duration(value)
-            if parsed_d != 0 or delay_seconds == 0:
-                delay_seconds = parsed_d
-        elif tag in ('wijzigingtype', 'tekst', 'treinstatus', 'status', 'vervallen', 'oorzaakkort'):
-            lowered = value.lower()
-            if value == '32' or any(tok in lowered for tok in ('rijdt niet', 'vervallen', 'cancelled', 'canceled', 'niet gereden', 'nietopgevoerd', 'rijdetniet', 'geannuleerd')):
-                is_cancelled = True
-            if value == '20' or 'toevoeging' in lowered:
-                is_extra_stop = True
-        elif tag in ('eindbestemming', 'bestemming', 'kortenaam', 'langenaam') and not destination:
-            destination = value
-        elif tag in ('treinsoort', 'treintype') and not train_type:
-            train_type = value
-        elif tag in ('vertrektijd', 'geplandevertrektijd') and not departure_time:
-            if 'T' in value:
-                try:
-                    dt_obj = datetime.fromisoformat(value.replace('Z', '+00:00'))
-                    departure_time = dt_obj.strftime('%H:%M')
-                except Exception:
-                    departure_time = value[:5]
-            else:
-                departure_time = value[:5]
+    def check_elem_cancellation(elem) -> bool:
+        for wt in elem.findall('.//WijzigingType'):
+            wt_text = (wt.text or '').strip()
+            if wt_text == '32' or any(tok in wt_text.lower() for tok in ('rijdt niet', 'vervallen', 'cancelled', 'canceled', 'niet gereden', 'nietopgevoerd', 'rijdetniet', 'geannuleerd')):
+                return True
+        for tag in ('tekst', 'treinstatus', 'status', 'vervallen', 'oorzaakkort'):
+            for sub in elem.findall(f'.//{tag}'):
+                txt = (sub.text or '').strip().lower()
+                if any(tok in txt for tok in ('rijdt niet', 'vervallen', 'cancelled', 'canceled', 'niet gereden', 'nietopgevoerd', 'rijdetniet', 'geannuleerd')):
+                    return True
+        return False
 
-    if journey_ref:
+    def check_elem_extra(elem) -> bool:
+        for wt in elem.findall('.//WijzigingType'):
+            wt_text = (wt.text or '').strip()
+            if wt_text == '20' or 'toevoeging' in wt_text.lower():
+                return True
+        return False
+
+    # Check for per-stop elements first
+    stop_elems = root.findall('.//RitStation') or root.findall('.//StopInfo') or root.findall('.//TreinStop')
+    if stop_elems:
+        for stop in stop_elems:
+            sc = stop.findtext('.//StationCode') or stop.findtext('StationCode')
+            if not sc:
+                continue
+            sc = sc.strip().lower()
+            is_canc = check_elem_cancellation(stop)
+            is_extra = check_elem_extra(stop)
+            dest = stop.findtext('.//EindBestemming/KorteNaam') or stop.findtext('.//EindBestemming/LangeNaam') or stop.findtext('.//EindBestemming') or stop.findtext('.//Bestemming') or ''
+            train_type = stop.findtext('.//TreinSoort') or stop.findtext('.//TreinType') or ''
+            dep_time = ""
+            dep_raw = stop.findtext('.//VertrekTijd') or stop.findtext('.//GeplandeVertrekTijd') or ""
+            if dep_raw:
+                if 'T' in dep_raw:
+                    try:
+                        dt_obj = datetime.fromisoformat(dep_raw.replace('Z', '+00:00'))
+                        dep_time = dt_obj.strftime('%H:%M')
+                    except Exception:
+                        dep_time = dep_raw[:5]
+                else:
+                    dep_time = dep_raw[:5]
+
+            d_sec = 0
+            for dtag in delay_tags:
+                val = stop.findtext(f'.//{dtag}')
+                if val:
+                    d_sec = parse_iso_duration(val)
+                    break
+
+            records.append(DelayRecord(
+                journey_ref=journey_ref,
+                stop_code=sc,
+                delay_seconds=d_sec,
+                is_cancelled=is_canc,
+                source=envelope,
+                updated_at=now_iso,
+                departure_time=dep_time,
+                destination=dest,
+                train_type=train_type,
+                line_code='',
+                is_extra_stop=is_extra,
+            ))
+    else:
+        # Single element or station DVS
+        stop_code = root.findtext('.//StationCode') or root.findtext('.//StopCode') or ""
+        if stop_code:
+            stop_code = stop_code.strip().lower()
+        is_canc = check_elem_cancellation(root)
+        is_extra = check_elem_extra(root)
+        dest = root.findtext('.//EindBestemming/KorteNaam') or root.findtext('.//EindBestemming/LangeNaam') or root.findtext('.//EindBestemming') or root.findtext('.//Bestemming') or ''
+        train_type = root.findtext('.//TreinSoort') or root.findtext('.//TreinType') or ''
+        dep_time = ""
+        dep_raw = root.findtext('.//VertrekTijd') or root.findtext('.//GeplandeVertrekTijd') or ""
+        if dep_raw:
+            if 'T' in dep_raw:
+                try:
+                    dt_obj = datetime.fromisoformat(dep_raw.replace('Z', '+00:00'))
+                    dep_time = dt_obj.strftime('%H:%M')
+                except Exception:
+                    dep_time = dep_raw[:5]
+            else:
+                dep_time = dep_raw[:5]
+        d_sec = 0
+        for dtag in delay_tags:
+            val = root.findtext(f'.//{dtag}')
+            if val:
+                d_sec = parse_iso_duration(val)
+                break
+
         records.append(DelayRecord(
             journey_ref=journey_ref,
             stop_code=stop_code,
-            delay_seconds=delay_seconds,
-            is_cancelled=is_cancelled,
+            delay_seconds=d_sec,
+            is_cancelled=is_canc,
             source=envelope,
             updated_at=now_iso,
-            departure_time=departure_time,
-            destination=destination,
+            departure_time=dep_time,
+            destination=dest,
             train_type=train_type,
-            line_code=line_code,
-            is_extra_stop=is_extra_stop,
+            line_code='',
+            is_extra_stop=is_extra,
         ))
 
     return records

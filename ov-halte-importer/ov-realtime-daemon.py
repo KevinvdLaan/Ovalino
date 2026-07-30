@@ -415,24 +415,41 @@ class InfoPlusSubscriber(threading.Thread):
         if train_num.isdigit():
             train_num = str(int(train_num))
 
-        is_cancelled = self._check_cancellation(rit)
-
-        # Extract stations from RitInfo stop list or single StationCode
-        stations = set()
-        for sc in rit.findall('.//StationCode'):
-            if sc.text:
-                stations.add(sc.text.strip().lower())
-
-        delay_seconds = 0
-        delay_elem = rit.findtext('.//VertrekVertraging') or rit.findtext('.//Vertraging') or rit.findtext('.//Delay')
-        if delay_elem:
-            delay_seconds = parse_iso_duration(delay_elem)
-
         dest = rit.findtext('.//EindBestemming/KorteNaam') or rit.findtext('.//EindBestemming/LangeNaam') or rit.findtext('.//EindBestemming') or rit.findtext('.//Bestemming') or ''
         train_type = rit.findtext('.//TreinSoort') or rit.findtext('.//TreinType') or ''
 
-        for station_code in stations:
-            self.db.upsert_delay(train_num, station_code, delay_seconds, is_cancelled, destination=dest, train_type=train_type)
+        # Process stop elements individually
+        stops = rit.findall('.//RitStation') or rit.findall('.//StopInfo') or rit.findall('.//TreinStop')
+        if stops:
+            for stop in stops:
+                sc = stop.findtext('.//StationCode') or stop.findtext('StationCode')
+                if not sc:
+                    continue
+                station_code = sc.strip().lower()
+                is_cancelled = self._check_cancellation(stop)
+                delay_seconds = 0
+                delay_elem = stop.findtext('.//VertrekVertraging') or stop.findtext('.//Vertraging') or stop.findtext('.//Delay')
+                if delay_elem:
+                    delay_seconds = parse_iso_duration(delay_elem)
+                dep_time_raw = stop.findtext('.//VertrekTijd') or stop.findtext('.//GeplandeVertrekTijd') or ''
+                dep_time = ''
+                if dep_time_raw:
+                    try:
+                        dt_obj = datetime.fromisoformat(dep_time_raw.replace('Z', '+00:00'))
+                        dep_time = dt_obj.strftime('%H:%M')
+                    except Exception:
+                        dep_time = dep_time_raw[:5] if len(dep_time_raw) >= 5 else dep_time_raw
+                self.db.upsert_delay(train_num, station_code, delay_seconds, is_cancelled, departure_time=dep_time, destination=dest, train_type=train_type)
+        else:
+            # Fallback for flat elements
+            sc_list = [sc.text.strip().lower() for sc in rit.findall('.//StationCode') if sc.text]
+            is_cancelled = self._check_cancellation(rit)
+            delay_seconds = 0
+            delay_elem = rit.findtext('.//VertrekVertraging') or rit.findtext('.//Vertraging')
+            if delay_elem:
+                delay_seconds = parse_iso_duration(delay_elem)
+            for station_code in sc_list:
+                self.db.upsert_delay(train_num, station_code, delay_seconds, is_cancelled, destination=dest, train_type=train_type)
 
 
 def main():
