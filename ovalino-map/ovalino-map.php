@@ -804,18 +804,25 @@ class Ovalino_Map {
 		$sql = "
 			SELECT so.station_code,
 			       d.train_type, d.line_code, d.destination_name as destination, so.departure_seconds as dep_sec, j.direction_ref,
+			       j.journey_ref, j.train_number,
 			       rd.delay_seconds, rd.is_cancelled
 			FROM " . self::table('ovtd', 'journey_stops') . " so
 			INNER JOIN " . self::table('ovtd', 'journeys') . " j ON j.journey_ref = so.journey_ref
 			INNER JOIN " . self::table('ovtd', 'directions') . " d ON d.direction_ref = j.direction_ref
 			LEFT JOIN " . $wpdb->prefix . "ovhi_realtime_delays rd
-				ON rd.journey_ref = j.journey_ref
+				ON (rd.journey_ref = j.journey_ref OR rd.journey_ref = j.train_number OR rd.journey_ref = TRIM(LEADING '0' FROM j.train_number))
 				AND rd.stop_code = so.station_code
 			WHERE so.station_code IN ($placeholders)
 			ORDER BY so.station_code, so.departure_seconds ASC
 		";
 
 		$results = $wpdb->get_results($wpdb->prepare($sql, ...$params), ARRAY_A);
+
+		// Single-pass NS API fallback voor stations zonder DB match indien OV_Trein_Dienstregeling aanwezig is
+		$ns_delays = array();
+		if (class_exists('OV_Trein_Dienstregeling') && method_exists('OV_Trein_Dienstregeling', 'fetch_ns_api_delays')) {
+			$ns_delays = OV_Trein_Dienstregeling::fetch_ns_api_delays($station_codes);
+		}
 
 		foreach ($results as $row) {
 			$station_code = $row['station_code'];
@@ -832,9 +839,31 @@ class Ovalino_Map {
 
 			$ts = self::timestamp_from_service_seconds($service_date, (int)$row['dep_sec']);
 
+			$delay_seconds = isset($row['delay_seconds']) ? (int) $row['delay_seconds'] : 0;
+			$is_cancelled = !empty($row['is_cancelled']);
+
+			// Indien geen DB match, controleer NS API resultaten
+			if ($delay_seconds === 0 && !$is_cancelled && !empty($ns_delays)) {
+				$clean_st = strtolower($station_code);
+				$raw_tnum = isset($row['train_number']) ? trim((string) $row['train_number']) : '';
+				$clean_tnum = ltrim($raw_tnum, '0');
+				$ns_candidates = array(
+					$raw_tnum . '|' . $clean_st,
+					$clean_tnum . '|' . $clean_st,
+					$raw_tnum,
+					$clean_tnum,
+				);
+				foreach ($ns_candidates as $cand) {
+					if ($cand !== '' && isset($ns_delays[$cand]) && is_array($ns_delays[$cand])) {
+						$delay_seconds = (int) $ns_delays[$cand]['delay_seconds'];
+						$is_cancelled = !empty($ns_delays[$cand]['is_cancelled']);
+						break;
+					}
+				}
+			}
+
 			// Blijf zichtbaar tot de geplande tijd is verstreken (bij voorloop) of tot de
 			// vertraagde tijd is verstreken (bij vertraging): gebruik steeds de laatste van de twee.
-			$delay_seconds = isset($row['delay_seconds']) ? (int) $row['delay_seconds'] : 0;
 			$realtime_ts = $ts + $delay_seconds;
 			$visibility_ts = max($ts, $realtime_ts);
 
@@ -851,8 +880,8 @@ class Ovalino_Map {
 					'line' => $line_badge,
 					'destination' => $row['destination'],
 					'time' => $dt->format('H:i'),
-					'delay_seconds' => isset($row['delay_seconds']) ? (int) $row['delay_seconds'] : 0,
-					'is_cancelled' => !empty($row['is_cancelled']),
+					'delay_seconds' => $delay_seconds,
+					'is_cancelled' => $is_cancelled,
 					'lineRef' => $direction_ref,
 					'direction' => $direction_ref,
 					'timestamp' => $ts

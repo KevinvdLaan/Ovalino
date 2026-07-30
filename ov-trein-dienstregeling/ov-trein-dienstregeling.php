@@ -2124,7 +2124,7 @@ class OV_Trein_Dienstregeling {
 
 			$time_str = $cand['scheduled_time']->format('H:i');
 			if ($cand['is_cancelled']) {
-				$time_str = '<s>' . $time_str . '</s> <span class="ov-cancelled" style="color: #d93025; font-weight: bold;">Vervallen</span>';
+				$time_str = '<span class="ov-cancelled" style="color: #d93025; font-weight: bold;">Rijdt niet</span>';
 			} elseif ($cand['delay_seconds'] > 0) {
 				$delay_minutes = round($cand['delay_seconds'] / 60);
 				if ($delay_minutes > 0) {
@@ -3106,12 +3106,14 @@ class OV_Trein_Dienstregeling {
 			return null;
 		}
 
-		$candidates = array($journey_ref);
+		$clean_ref = ltrim($journey_ref, '0');
+		$candidates = array($journey_ref, $clean_ref);
 		if ($station_code !== '') {
 			$candidates[] = $journey_ref . '|' . $station_code;
+			$candidates[] = $clean_ref . '|' . $station_code;
 		}
 		foreach ($candidates as $candidate) {
-			if (isset($delays[$candidate]) && is_array($delays[$candidate])) {
+			if ($candidate !== '' && isset($delays[$candidate]) && is_array($delays[$candidate])) {
 				return $delays[$candidate];
 			}
 		}
@@ -3124,7 +3126,7 @@ class OV_Trein_Dienstregeling {
 			return $time_str;
 		}
 		if (!empty($delay_info['is_cancelled'])) {
-			return '<s>' . $time_str . '</s> <span class="ov-cancelled" style="color: #d93025; font-size: 11px; font-weight: bold;">Vervallen</span>';
+			return '<span class="ov-cancelled" style="color: #d93025; font-weight: bold;">Rijdt niet</span>';
 		}
 		$delay_seconds = (int) $delay_info['delay_seconds'];
 		if ($delay_seconds > 0) {
@@ -3193,7 +3195,7 @@ class OV_Trein_Dienstregeling {
 						continue;
 					}
 
-					$is_cancelled = !empty($dep['cancelled']) && $dep['cancelled'] === true;
+					$is_cancelled = (!empty($dep['cancelled']) && $dep['cancelled'] === true) || (isset($dep['departureStatus']) && strtoupper((string) $dep['departureStatus']) === 'CANCELLED');
 
 					$delay_seconds = 0;
 					if (!empty($dep['delayInSeconds'])) {
@@ -3207,9 +3209,11 @@ class OV_Trein_Dienstregeling {
 					}
 
 					$item = array('delay_seconds' => $delay_seconds, 'is_cancelled' => $is_cancelled);
+					$clean_num = ltrim($train_num, '0');
 					$station_delays[$train_num . '|' . $station_code] = $item;
-					// Also index by train number alone so matching without stop code works
+					$station_delays[$clean_num . '|' . $station_code] = $item;
 					$station_delays[$train_num] = $item;
+					$station_delays[$clean_num] = $item;
 				}
 			}
 

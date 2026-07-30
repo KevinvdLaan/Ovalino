@@ -335,8 +335,34 @@ class InfoPlusSubscriber(threading.Thread):
             root = ET.fromstring(xml_clean)
             for dvs in root.findall('.//DynamischeVertrekStaat'):
                 self.process_dvs(dvs)
+            for rit in root.findall('.//RitBericht') + root.findall('.//TreinRit') + root.findall('.//RitInfo'):
+                self.process_rit(rit)
         except Exception:
             pass
+
+    def _check_cancellation(self, element):
+        """Check if an XML element or its children indicate train cancellation (e.g. WijzigingType 32 or 'Rijdt niet')."""
+        cancellation_keywords = ('VERVALLEN', 'RIJDT NIET', 'RIJDETNIET', 'GEANNULEERD', 'CANCEL', 'DELETED', 'NIETOPGEVOERD', 'NIET GEREDEN')
+        
+        # Check WijzigingType (value 32 specifically means 'Rijdt niet' in InfoPlus DVS/RIT)
+        for wt in element.findall('.//WijzigingType'):
+            wt_text = (wt.text or '').strip()
+            if wt_text == '32' or any(kw in wt_text.upper() for kw in cancellation_keywords):
+                return True
+
+        # Check Tekst, TreinStatus, OorzaakKort, Status, etc.
+        for tag in ('Tekst', 'TreinStatus', 'OorzaakKort', 'OorzaakLang', 'Status', 'Wijziging'):
+            for sub in element.findall(f'.//{tag}'):
+                txt = (sub.text or '').strip().upper()
+                if any(kw in txt for kw in cancellation_keywords):
+                    return True
+
+        # Also check all text content of the element as fallback
+        all_text = ''.join(element.itertext()).upper()
+        if 'WIJZIGINGTYPE>32' in all_text or any(kw in all_text for kw in ('RIJDT NIET', 'VERVALLEN', 'GEANNULEERD')):
+            return True
+
+        return False
 
     def process_dvs(self, dvs):
         train_num = dvs.findtext('.//TreinNummer') or dvs.findtext('.//RitId')
@@ -346,17 +372,10 @@ class InfoPlusSubscriber(threading.Thread):
 
         station_code = station_code.strip().lower()
         train_num = train_num.strip()
-        # Normalize to the canonical form without leading zeros. NS/InfoPlus
-        # normally sends unpadded numbers already ("3617"), but this keeps
-        # the daemon consistent with the zero-stripped train_number stored
-        # by ov-trein-dienstregeling.php's IFF import (which otherwise
-        # preserves fixed-width padding like "03617"), regardless of which
-        # side ends up padding in the future.
         if train_num.isdigit():
             train_num = str(int(train_num))
 
-        status_text = (dvs.findtext('.//TreinStatus') or dvs.findtext('.//WijzigingType') or '').upper()
-        is_cancelled = 'CANCEL' in status_text or 'VERVALLEN' in status_text or 'RIJDETNIET' in status_text
+        is_cancelled = self._check_cancellation(dvs)
 
         delay_seconds = 0
         delay_elem = dvs.findtext('.//VertrekVertraging') or dvs.findtext('.//Vertraging')
@@ -364,6 +383,30 @@ class InfoPlusSubscriber(threading.Thread):
             delay_seconds = parse_iso_duration(delay_elem)
 
         self.db.upsert_delay(train_num, station_code, delay_seconds, is_cancelled)
+
+    def process_rit(self, rit):
+        train_num = rit.findtext('.//TreinNummer') or rit.findtext('.//RitId') or rit.findtext('.//RitNummer')
+        if not train_num:
+            return
+        train_num = train_num.strip()
+        if train_num.isdigit():
+            train_num = str(int(train_num))
+
+        is_cancelled = self._check_cancellation(rit)
+
+        # Extract stations from RitInfo stop list or single StationCode
+        stations = set()
+        for sc in rit.findall('.//StationCode'):
+            if sc.text:
+                stations.add(sc.text.strip().lower())
+
+        delay_seconds = 0
+        delay_elem = rit.findtext('.//VertrekVertraging') or rit.findtext('.//Vertraging') or rit.findtext('.//Delay')
+        if delay_elem:
+            delay_seconds = parse_iso_duration(delay_elem)
+
+        for station_code in stations:
+            self.db.upsert_delay(train_num, station_code, delay_seconds, is_cancelled)
 
 
 def main():

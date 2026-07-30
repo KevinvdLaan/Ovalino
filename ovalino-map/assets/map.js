@@ -358,7 +358,7 @@ function createPopupContent(stop) {
     function formatDepartureTime(dep) {
         var time = escapeHtml(dep.time || '');
         if (dep.is_cancelled) {
-            return '<span style="color:#d00;text-decoration:line-through;">' + time + '</span> <span style="color:#d00;font-weight:700;">(vervallen)</span>';
+            return '<span style="color:#d00;font-weight:700;">Rijdt niet</span>';
         }
         var delay = Number(dep.delay_seconds || 0);
         if (delay === 0) {
