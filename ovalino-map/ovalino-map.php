@@ -621,11 +621,10 @@ class Ovalino_Map {
 			}
 			$ts = $dt->getTimestamp();
 
-			// Blijf zichtbaar tot de geplande tijd is verstreken (bij voorloop) of tot de
-			// vertraagde tijd is verstreken (bij vertraging): gebruik steeds de laatste van de twee.
+			// Blijf zichtbaar tot de geplande tijd is verstreken (bij voorloop) of tot een
+			// minuut na de vertraagde vertrektijd (bij vertraging).
 			$delay_seconds = isset($row['delay_seconds']) ? (int) $row['delay_seconds'] : 0;
-			$realtime_ts = $ts + $delay_seconds;
-			$visibility_ts = max($ts, $realtime_ts);
+			$visibility_ts = self::calculate_visibility_cutoff($ts, $delay_seconds);
 
 			if ($visibility_ts >= $now && $ts <= $two_hours_later) {
 				$candidates_by_quay_line[$key][$ts] = array(
@@ -914,7 +913,7 @@ class Ovalino_Map {
 			       so.stop_order,
 			       so.departure_seconds as dep_sec,
 			       so.arrival_seconds as arr_sec,
-			       d.train_type, d.line_code, d.destination_name as destination, j.direction_ref, j.footnote_ref,
+			       d.train_type, d.line_code, d.destination_name as destination, j.journey_ref, j.train_number, j.direction_ref, j.footnote_ref,
 			       rd.delay_seconds, rd.is_cancelled,
 			       jm.max_stop_order
 			FROM " . self::table('ovtd', 'journey_stops') . " so
@@ -933,6 +932,44 @@ class Ovalino_Map {
 		";
 
 		$results = $wpdb->get_results($wpdb->prepare($sql, ...$params), ARRAY_A);
+
+		// Fetch realtime delay rows for these results with the same resilient matching as the frontend
+		$lookup_journey_refs = array();
+		$scheduled_refs_by_lookup = array();
+		foreach ($results as $r) {
+			$scheduled_ref = isset($r['journey_ref']) ? trim((string) $r['journey_ref']) : '';
+			$train_number = isset($r['train_number']) ? trim((string) $r['train_number']) : '';
+			if ($scheduled_ref === '') continue;
+			$refs = array($scheduled_ref);
+			if ($train_number !== '') $refs[] = $train_number;
+			foreach (array_values(array_unique(array_filter($refs, 'strlen'))) as $ref) {
+				$lookup_journey_refs[] = $ref;
+				if (!isset($scheduled_refs_by_lookup[$ref])) $scheduled_refs_by_lookup[$ref] = array();
+				$scheduled_refs_by_lookup[$ref][] = $scheduled_ref;
+			}
+		}
+		$lookup_journey_refs = array_values(array_unique($lookup_journey_refs));
+
+		$delay_map = array();
+		$realtime_table = $wpdb->prefix . 'ovhi_realtime_delays';
+		if (!empty($lookup_journey_refs) && (bool) $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $realtime_table))) {
+			$j_placeholders = implode(',', array_fill(0, count($lookup_journey_refs), '%s'));
+			$station_placeholders = implode(',', array_fill(0, count($normalized_station_codes), '%s'));
+			$one_hour_ago = date('Y-m-d H:i:s', time() - 3600);
+			$params_delay = array_merge($lookup_journey_refs, $normalized_station_codes, array($one_hour_ago));
+			$delay_rows = $wpdb->get_results($wpdb->prepare(
+				"SELECT journey_ref, stop_code, delay_seconds, is_cancelled FROM $realtime_table WHERE journey_ref IN ($j_placeholders) AND stop_code IN ($station_placeholders) AND updated_at >= %s",
+				...$params_delay
+			), ARRAY_A);
+			if (!empty($delay_rows)) {
+				foreach ($delay_rows as $d_row) {
+					$matched_refs = isset($scheduled_refs_by_lookup[$d_row['journey_ref']]) ? $scheduled_refs_by_lookup[$d_row['journey_ref']] : array($d_row['journey_ref']);
+					foreach ($matched_refs as $matched_ref) {
+						$delay_map[$matched_ref . '|' . strtolower($d_row['stop_code'])] = $d_row;
+					}
+				}
+			}
+		}
 
 		foreach ($results as $row) {
 			$station_code = self::normalize_station_code($row['station_code']);
@@ -984,11 +1021,20 @@ class Ovalino_Map {
 				continue;
 			}
 
-			// Blijf zichtbaar tot de geplande tijd is verstreken (bij voorloop) of tot de
-			// vertraagde tijd is verstreken (bij vertraging): gebruik steeds de laatste van de twee.
-			$delay_seconds = isset($row['delay_seconds']) ? (int) $row['delay_seconds'] : 0;
-			$realtime_ts = $ts + $delay_seconds;
-			$visibility_ts = max($ts, $realtime_ts);
+			// Blijf zichtbaar tot de geplande tijd is verstreken (bij voorloop) of tot een
+			// minuut na de vertraagde vertrektijd (bij vertraging). Probeer realtime-waarden
+			// te halen uit de eerder opgehaalde delay_map (die zowel journey_ref als
+			// train_number kan matchen). Val terug op de kolommen uit de query indien
+			// geen realtime-waarde beschikbaar is.
+			$key_for_delay = (isset($row['journey_ref']) ? $row['journey_ref'] : '') . '|' . strtolower($station_code);
+			if ($key_for_delay !== '' && isset($delay_map[$key_for_delay])) {
+				$delay_seconds = isset($delay_map[$key_for_delay]['delay_seconds']) ? (int) $delay_map[$key_for_delay]['delay_seconds'] : 0;
+				$is_cancelled = !empty($delay_map[$key_for_delay]['is_cancelled']);
+			} else {
+				$delay_seconds = isset($row['delay_seconds']) ? (int) $row['delay_seconds'] : 0;
+				$is_cancelled = !empty($row['is_cancelled']);
+			}
+			$visibility_ts = self::calculate_visibility_cutoff($ts, $delay_seconds);
 
 			if ($visibility_ts >= $now && $ts <= $two_hours_later) {
 				$timezone = wp_timezone();
@@ -1003,8 +1049,8 @@ class Ovalino_Map {
 					'line' => $line_badge,
 					'destination' => $row['destination'],
 					'time' => $dt->format('H:i'),
-					'delay_seconds' => isset($row['delay_seconds']) ? (int) $row['delay_seconds'] : 0,
-					'is_cancelled' => !empty($row['is_cancelled']),
+					'delay_seconds' => isset($delay_seconds) ? (int) $delay_seconds : 0,
+					'is_cancelled' => !empty($is_cancelled),
 					'lineRef' => $direction_ref,
 					'direction' => $direction_ref,
 					'timestamp' => $ts
@@ -1162,6 +1208,15 @@ class Ovalino_Map {
 			'start' => $start,
 			'end' => $end,
 		);
+	}
+
+	private static function calculate_visibility_cutoff($scheduled_ts, $delay_seconds) {
+		$delay_seconds = max(0, (int) $delay_seconds);
+		$extra = defined('MINUTE_IN_SECONDS') ? MINUTE_IN_SECONDS : 60;
+		if ($delay_seconds > 0) {
+			return $scheduled_ts + $delay_seconds + $extra;
+		}
+		return $scheduled_ts;
 	}
 
 	private static function timestamp_from_service_seconds($service_date, $seconds) {
