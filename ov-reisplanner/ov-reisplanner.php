@@ -2,7 +2,7 @@
 /**
  * Plugin Name: OV Reisplanner
  * Description: Eenvoudige statische reisplanner op basis van OV Halte Importer en OV Trein Dienstregeling.
- * Version: 0.3.1
+ * Version: 0.3.2
  * Author: Kevin van der Laan
  * License: GPL-2.0-or-later
  * Requires Plugins: ov-halte-importer, ov-trein-dienstregeling
@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) {
 }
 
 class OV_Reisplanner {
-	const VERSION = '0.3.1';
+	const VERSION = '0.3.2';
 	const FRONTEND_STYLE = 'ovrp-frontend';
 	const SERVICE_DAY_START_SECONDS = 14400;
 	const DEFAULT_MIN_TRANSFER_SECONDS = 240;
@@ -1246,7 +1246,7 @@ class OV_Reisplanner {
 
 			$sql = '
 				SELECT j.journey_ref, j.train_number, j.footnote_ref, j.departure_seconds AS journey_departure_seconds,
-					d.train_type, d.destination_name,
+					d.train_type, d.line_code, d.destination_name,
 					so.station_code AS from_ref, sfo.station_name AS from_name,
 					sd.station_code AS to_ref, sfd.station_name AS to_name,
 					so.departure_seconds AS from_departure, so.arrival_seconds AS from_arrival, so.stop_order AS from_order,
@@ -1299,7 +1299,7 @@ class OV_Reisplanner {
 						'from_order' => (int) $row['from_order'],
 						'to_order' => (int) $row['to_order'],
 						'line' => self::train_badge((string) $row['train_type']),
-						'line_name' => trim((string) $row['destination_name']) !== '' ? 'richting ' . trim((string) $row['destination_name']) : '',
+						'line_name' => self::format_line_name(isset($row['line_code']) ? (string) $row['line_code'] : '', (string) $row['destination_name']),
 						'colour' => '',
 						'text_colour' => '',
 						'attributes' => isset($row['attributes']) ? (string) $row['attributes'] : '',
@@ -1543,7 +1543,7 @@ class OV_Reisplanner {
 				$wpdb->prepare(
 					'
 					SELECT j.journey_ref, j.train_number, j.footnote_ref, j.departure_seconds AS journey_departure_seconds,
-						d.train_type, d.destination_name,
+						d.train_type, d.line_code, d.destination_name,
 						so.station_code AS from_ref, sfo.station_name AS from_name,
 						sd.station_code AS to_ref, sfd.station_name AS to_name,
 						so.departure_seconds AS from_departure, so.arrival_seconds AS from_arrival, so.stop_order AS from_order,
@@ -1598,7 +1598,7 @@ class OV_Reisplanner {
 					'from_order' => (int) $row['from_order'],
 					'to_order' => (int) $row['to_order'],
 					'line' => self::train_badge((string) $row['train_type']),
-					'line_name' => trim((string) $row['destination_name']) !== '' ? 'richting ' . trim((string) $row['destination_name']) : '',
+					'line_name' => self::format_line_name(isset($row['line_code']) ? (string) $row['line_code'] : '', (string) $row['destination_name']),
 					'colour' => '',
 					'text_colour' => '',
 					'attributes' => isset($row['attributes']) ? (string) $row['attributes'] : '',
@@ -2775,6 +2775,24 @@ if ($has_train && $has_bus) {
 			'Sneltrein' => 'Snl',
 		);
 		return isset($map[$train_type]) ? $map[$train_type] : ($train_type !== '' ? mb_substr($train_type, 0, 3) : 'Trein');
+	}
+
+	/**
+	 * Build the "richting X" text for a leg, prefixed with the line code
+	 * when one is known (e.g. "RSx richting Veendam"). Regional operators
+	 * such as Arriva and Blauwnet already deliver this via IFF; NS is
+	 * expected to start delivering the same field from December. The round
+	 * badge (train_badge()) keeps showing the abbreviated train type
+	 * regardless, since that is derived from train_type directly.
+	 */
+	private static function format_line_name($line_code, $destination_name) {
+		$destination_name = trim((string) $destination_name);
+		if ($destination_name === '') {
+			return '';
+		}
+		$line_code = strtoupper(trim((string) $line_code));
+		$prefix = $line_code !== '' ? $line_code . ' ' : '';
+		return $prefix . 'richting ' . $destination_name;
 	}
 
 	private static function format_timestamp($timestamp) {

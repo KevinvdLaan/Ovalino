@@ -345,34 +345,17 @@ class OV_Halte_Importer {
 			$wpdb->query("ALTER TABLE $table_stop_offsets ADD INDEX line_ref_dir (line_ref, direction_type)");
 		}
 
-		// Migrate journeys table: add journey_number
+		// Migrate journeys table: add journey_number, gevuld uit het NeTEx
+		// <PrivateCode type="JourneyNumber"> veld op ServiceJourney-niveau.
+		// Dit vervangt het gokken naar het ritnummer op basis van de opbouw
+		// van het lange journey_ref/id (wat alleen toevallig klopte voor
+		// vervoerders wier ID-structuur op Qbuzz's exportformaat leek).
 		$table_journeys = self::table('journeys');
 		$journey_columns = $wpdb->get_results("DESCRIBE $table_journeys");
 		$journey_column_names = wp_list_pluck($journey_columns, 'Field');
 		if (!in_array('journey_number', $journey_column_names, true)) {
 			$wpdb->query("ALTER TABLE $table_journeys ADD COLUMN journey_number varchar(20) NOT NULL default '' AFTER journey_ref");
 			$wpdb->query("ALTER TABLE $table_journeys ADD INDEX journey_number (journey_number)");
-		}
-
-		// Migrate realtime_delays table: add columns for extra stops & realtime departures
-		$table_realtime = self::table('realtime_delays');
-		if ((bool) $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $table_realtime))) {
-			$cols = wp_list_pluck($wpdb->get_results("DESCRIBE $table_realtime"), 'Field');
-			if (!in_array('departure_time', $cols, true)) {
-				$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN departure_time varchar(30) NOT NULL default '' AFTER is_cancelled");
-			}
-			if (!in_array('destination', $cols, true)) {
-				$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN destination varchar(255) NOT NULL default '' AFTER departure_time");
-			}
-			if (!in_array('train_type', $cols, true)) {
-				$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN train_type varchar(50) NOT NULL default '' AFTER destination");
-			}
-			if (!in_array('line_code', $cols, true)) {
-				$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN line_code varchar(50) NOT NULL default '' AFTER train_type");
-			}
-			if (!in_array('is_extra_stop', $cols, true)) {
-				$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN is_extra_stop tinyint(1) NOT NULL default 0 AFTER line_code");
-			}
 		}
 	}
 
@@ -899,45 +882,30 @@ class OV_Halte_Importer {
 			}
 		}
 
-		$departure_time = isset($item['departure_time']) ? trim((string) $item['departure_time']) : (isset($item['time']) ? trim((string) $item['time']) : '');
-		$destination = isset($item['destination']) ? trim((string) $item['destination']) : '';
-		$train_type = isset($item['train_type']) ? trim((string) $item['train_type']) : '';
-		$line_code = isset($item['line_code']) ? trim((string) $item['line_code']) : '';
-		$is_extra_stop = !empty($item['is_extra_stop']) || !empty($item['extra_stop']) ? 1 : 0;
-
-		if ($journey_ref !== '') {
-			$alt_journey_refs = array($journey_ref, ltrim($journey_ref, '0'));
+		if ($journey_ref !== '' && $stop_code !== '') {
+			$alt_journey_refs = array($journey_ref);
 			if (strpos($journey_ref, ':') !== false) {
 				$parts = explode(':', $journey_ref);
 				$last_part = end($parts);
 				if ($last_part !== '' && $last_part !== $journey_ref) {
 					$alt_journey_refs[] = $last_part;
-					$alt_journey_refs[] = ltrim($last_part, '0');
 				}
 			}
-			$alt_journey_refs = array_values(array_unique(array_filter($alt_journey_refs, 'strlen')));
 
 			$alt_stop_codes = array($stop_code);
-			if ($stop_code !== '') {
-				if (preg_match('/^NL:Q:(\d+)$/', $stop_code, $m)) {
-					$alt_stop_codes[] = $m[1];
-				} elseif (preg_match('/^\d+$/', $stop_code)) {
-					$alt_stop_codes[] = 'NL:Q:' . $stop_code;
-				}
+			if (preg_match('/^NL:Q:(\d+)$/', $stop_code, $m)) {
+				$alt_stop_codes[] = $m[1];
+			} elseif (preg_match('/^\d+$/', $stop_code)) {
+				$alt_stop_codes[] = 'NL:Q:' . $stop_code;
 			}
 
 			foreach ($alt_journey_refs as $j_ref) {
 				foreach ($alt_stop_codes as $s_code) {
 					$entries[] = array(
-						'journey_ref'    => $j_ref,
-						'stop_code'      => $s_code,
-						'delay_seconds'  => $delay_seconds,
-						'is_cancelled'   => $is_cancelled ? 1 : 0,
-						'departure_time' => $departure_time,
-						'destination'    => $destination,
-						'train_type'     => $train_type,
-						'line_code'      => $line_code,
-						'is_extra_stop'  => $is_extra_stop,
+						'journey_ref'   => $j_ref,
+						'stop_code'     => $s_code,
+						'delay_seconds' => $delay_seconds,
+						'is_cancelled'  => $is_cancelled ? 1 : 0,
 					);
 				}
 			}
@@ -1019,7 +987,7 @@ class OV_Halte_Importer {
 			$stop_code = isset($row['stop_code']) ? trim((string) $row['stop_code']) : '';
 			$journey_ref = substr($journey_ref, 0, 120);
 			$stop_code = substr($stop_code, 0, 100);
-			if ($journey_ref === '') {
+			if ($journey_ref === '' || $stop_code === '') {
 				continue;
 			}
 			$row['journey_ref'] = $journey_ref;
@@ -1039,19 +1007,14 @@ class OV_Halte_Importer {
 			$values = array();
 			$queries = array();
 			foreach ($chunk as $row) {
-				$queries[] = '(%s, %s, %d, %d, %s, %s, %s, %s, %d, NOW())';
+				$queries[] = '(%s, %s, %d, %d, NOW())';
 				$values[] = isset($row['journey_ref']) ? $row['journey_ref'] : '';
 				$values[] = isset($row['stop_code']) ? $row['stop_code'] : '';
 				$values[] = isset($row['delay_seconds']) ? (int) $row['delay_seconds'] : 0;
 				$values[] = isset($row['is_cancelled']) ? (int) $row['is_cancelled'] : 0;
-				$values[] = isset($row['departure_time']) ? $row['departure_time'] : '';
-				$values[] = isset($row['destination']) ? $row['destination'] : '';
-				$values[] = isset($row['train_type']) ? $row['train_type'] : '';
-				$values[] = isset($row['line_code']) ? $row['line_code'] : '';
-				$values[] = !empty($row['is_extra_stop']) ? 1 : 0;
 			}
 
-			$sql = 'INSERT INTO ' . $table . ' (journey_ref, stop_code, delay_seconds, is_cancelled, departure_time, destination, train_type, line_code, is_extra_stop, updated_at) VALUES ' . implode(', ', $queries) . ' ON DUPLICATE KEY UPDATE delay_seconds = VALUES(delay_seconds), is_cancelled = VALUES(is_cancelled), departure_time = VALUES(departure_time), destination = VALUES(destination), train_type = VALUES(train_type), line_code = VALUES(line_code), is_extra_stop = VALUES(is_extra_stop), updated_at = NOW()';
+			$sql = 'INSERT INTO ' . $table . ' (journey_ref, stop_code, delay_seconds, is_cancelled, updated_at) VALUES ' . implode(', ', $queries) . ' ON DUPLICATE KEY UPDATE delay_seconds = VALUES(delay_seconds), is_cancelled = VALUES(is_cancelled), updated_at = NOW()';
 			$result = $wpdb->query($wpdb->prepare($sql, $values));
 
 			if ($result === false) {
@@ -1861,12 +1824,10 @@ class OV_Halte_Importer {
 	}
 
 	private static function get_realtime_delay_map(array $journey_refs, array $stop_codes) {
+		self::sync_remote_realtime_delays_if_needed();
 		global $wpdb;
 
-		$raw_jrefs = array_values(array_filter(array_map('trim', array_unique($journey_refs))));
-		$clean_jrefs = array_values(array_filter(array_map(function($j) { return ltrim(trim($j), '0'); }, $raw_jrefs)));
-		$journey_refs = array_values(array_unique(array_merge($raw_jrefs, $clean_jrefs)));
-
+		$journey_refs = array_values(array_filter(array_map('trim', array_unique($journey_refs))));
 		$stop_codes = array_values(array_filter(array_map('trim', array_unique($stop_codes))));
 		if (empty($journey_refs) || empty($stop_codes)) {
 			return array();
@@ -1893,40 +1854,25 @@ class OV_Halte_Importer {
 
 		$table = self::table('realtime_delays');
 		$placeholders_j = implode(',', array_fill(0, count($journey_refs), '%s'));
-		$params = $journey_refs;
+		$placeholders_s = implode(',', array_fill(0, count($lookup_stop_codes), '%s'));
+		$params = array_merge($journey_refs, $lookup_stop_codes);
 
-		$query = 'SELECT journey_ref, stop_code, delay_seconds, is_cancelled FROM ' . $table . ' WHERE journey_ref IN (' . $placeholders_j . ')';
+		$query = 'SELECT journey_ref, stop_code, delay_seconds, is_cancelled FROM ' . $table . ' WHERE journey_ref IN (' . $placeholders_j . ') AND stop_code IN (' . $placeholders_s . ')';
 		$rows = $wpdb->get_results($wpdb->prepare($query, $params), ARRAY_A);
 
 		$map = array();
 		foreach ((array) $rows as $row) {
-			$jref = $row['journey_ref'];
-			$clean_jref = ltrim($jref, '0');
-			$scode = trim((string)$row['stop_code']);
-			$val = array(
+			$key = $row['journey_ref'] . '|' . $row['stop_code'];
+			$map[$key] = array(
 				'delay_seconds' => isset($row['delay_seconds']) ? (int) $row['delay_seconds'] : 0,
 				'is_cancelled'  => !empty($row['is_cancelled']),
 			);
-
-			$map[$jref . '|' . $scode] = $val;
-			$map[$clean_jref . '|' . $scode] = $val;
-
-			if (preg_match('/^NL:Q:(\d+)$/', $scode, $m)) {
-				$map[$jref . '|' . $m[1]] = $val;
-				$map[$clean_jref . '|' . $m[1]] = $val;
-			} elseif (preg_match('/^\d+$/', $scode)) {
-				$map[$jref . '|NL:Q:' . $scode] = $val;
-				$map[$clean_jref . '|NL:Q:' . $scode] = $val;
-			}
-			if ($scode === '') {
-				$map[$jref] = $val;
-				$map[$clean_jref] = $val;
-			}
 		}
 		return $map;
 	}
 
 	private static function get_realtime_delay($journey_ref, $stop_code) {
+		self::sync_remote_realtime_delays_if_needed();
 		global $wpdb;
 
 		$journey_ref = trim((string) $journey_ref);
@@ -3716,24 +3662,13 @@ private static function parse_assignment(XMLReader $reader) {
 		foreach ($valid_rows as $row) {
 			$journey_ref = isset($row['journey_ref']) ? (string) $row['journey_ref'] : '';
 			$stop_code = isset($row['user_stop_code']) ? (string) $row['user_stop_code'] : '';
-			$clean_jref = ltrim($journey_ref, '0');
-
-			$candidates_keys = array(
-				$journey_ref . '|' . $stop_code,
-				$clean_jref . '|' . $stop_code,
-				$journey_ref . '|NL:Q:' . $stop_code,
-				$clean_jref . '|NL:Q:' . $stop_code,
-				$journey_ref,
-				$clean_jref,
-			);
-			$delay = array('delay_seconds' => 0, 'is_cancelled' => false);
-			foreach ($candidates_keys as $ckey) {
-				if (isset($delay_map[$ckey]) && is_array($delay_map[$ckey])) {
-					$delay = $delay_map[$ckey];
-					if (!empty($delay['is_cancelled']) || !empty($delay['delay_seconds'])) {
-						break;
-					}
-				}
+			
+			$map_key = $journey_ref . '|' . $stop_code;
+			$delay = isset($delay_map[$map_key]) ? $delay_map[$map_key] : array('delay_seconds' => 0, 'is_cancelled' => false);
+			
+			if (empty($delay['delay_seconds']) && empty($delay['is_cancelled']) && preg_match('/^[0-9]+$/', $stop_code)) {
+				$alt_key = $journey_ref . '|NL:Q:' . $stop_code;
+				$delay = isset($delay_map[$alt_key]) ? $delay_map[$alt_key] : array('delay_seconds' => 0, 'is_cancelled' => false);
 			}
 
 			$row['delay_seconds'] = (is_array($delay) && isset($delay['delay_seconds'])) ? (int) $delay['delay_seconds'] : 0;
@@ -3789,14 +3724,14 @@ private static function parse_assignment(XMLReader $reader) {
 	private static function format_time_with_delay($time_str, $delay_seconds = 0, $is_cancelled = false) {
 		$time_html = esc_html((string) $time_str);
 		if ($is_cancelled) {
-			return '<span style="color:#d93025;font-weight:700;">Rijdt niet</span>';
+			return '<s>' . $time_html . '</s> <span style="color:#d00;font-weight:700;">(vervallen)</span>';
 		}
 		if (empty($delay_seconds)) {
 			return $time_html;
 		}
 		$sign = (int) $delay_seconds > 0 ? '+' : '-';
 		$minutes = (int) floor((abs((int) $delay_seconds) + 59) / 60);
-		$color = (int) $delay_seconds > 0 ? '#d93025' : '#0a0';
+		$color = (int) $delay_seconds > 0 ? '#d00' : '#0a0';
 		return $time_html . ' <span style="color:' . esc_attr($color) . ';font-weight:700;">' . esc_html($sign . $minutes) . '</span>';
 	}
 

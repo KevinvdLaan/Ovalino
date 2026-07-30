@@ -123,9 +123,9 @@ class DelayDatabase:
         except Exception:
             self.connect()
 
-    def upsert_delay(self, journey_ref, stop_code, delay_seconds, is_cancelled, departure_time='', destination='', train_type='', line_code='', is_extra_stop=False):
+    def upsert_delay(self, journey_ref, stop_code, delay_seconds, is_cancelled):
         """Insert or update delay record."""
-        if not journey_ref:
+        if not journey_ref or not stop_code:
             return
         with self.lock:
             self.ensure_connection()
@@ -134,19 +134,14 @@ class DelayDatabase:
             try:
                 cursor = self.conn.cursor()
                 sql = f"""
-                    INSERT INTO {self.table_name} (journey_ref, stop_code, delay_seconds, is_cancelled, departure_time, destination, train_type, line_code, is_extra_stop, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    INSERT INTO {self.table_name} (journey_ref, stop_code, delay_seconds, is_cancelled, updated_at)
+                    VALUES (%s, %s, %s, %s, NOW())
                     ON DUPLICATE KEY UPDATE
                         delay_seconds = VALUES(delay_seconds),
                         is_cancelled = VALUES(is_cancelled),
-                        departure_time = VALUES(departure_time),
-                        destination = VALUES(destination),
-                        train_type = VALUES(train_type),
-                        line_code = VALUES(line_code),
-                        is_extra_stop = VALUES(is_extra_stop),
                         updated_at = NOW()
                 """
-                cursor.execute(sql, (journey_ref, stop_code or '', int(delay_seconds), 1 if is_cancelled else 0, departure_time or '', destination or '', train_type or '', line_code or '', 1 if is_extra_stop else 0))
+                cursor.execute(sql, (journey_ref, stop_code, int(delay_seconds), 1 if is_cancelled else 0))
                 cursor.close()
             except Exception as e:
                 print(f"[DB Error] upsert failed: {e}")
@@ -340,34 +335,39 @@ class InfoPlusSubscriber(threading.Thread):
             root = ET.fromstring(xml_clean)
             for dvs in root.findall('.//DynamischeVertrekStaat'):
                 self.process_dvs(dvs)
-            for rit in root.findall('.//RitBericht') + root.findall('.//TreinRit') + root.findall('.//RitInfo'):
-                self.process_rit(rit)
+            for rit_info in root.findall('.//RitInfo'):
+                self.process_rit_info(rit_info)
         except Exception:
             pass
 
-    def _check_cancellation(self, element):
-        """Check if an XML element or its children indicate train cancellation (e.g. WijzigingType 32 or 'Rijdt niet')."""
-        cancellation_keywords = ('VERVALLEN', 'RIJDT NIET', 'RIJDETNIET', 'GEANNULEERD', 'CANCEL', 'DELETED', 'NIETOPGEVOERD', 'NIET GEREDEN')
-        
-        # Check WijzigingType (value 32 specifically means 'Rijdt niet' in InfoPlus DVS/RIT)
-        for wt in element.findall('.//WijzigingType'):
-            wt_text = (wt.text or '').strip()
-            if wt_text == '32' or any(kw in wt_text.upper() for kw in cancellation_keywords):
-                return True
+    def process_rit_info(self, rit_info):
+        train_num = rit_info.findtext('.//TreinNummer') or rit_info.findtext('.//RitId') or rit_info.findtext('.//RitNummer') or rit_info.findtext('.//JourneyRef')
+        station_code = rit_info.findtext('.//StationCode') or rit_info.findtext('.//Station') or rit_info.findtext('.//StopCode') or rit_info.findtext('.//HalteCode')
+        if not train_num or not station_code:
+            return
 
-        # Check Tekst, TreinStatus, OorzaakKort, Status, etc.
-        for tag in ('Tekst', 'TreinStatus', 'OorzaakKort', 'OorzaakLang', 'Status', 'Wijziging'):
-            for sub in element.findall(f'.//{tag}'):
-                txt = (sub.text or '').strip().upper()
-                if any(kw in txt for kw in cancellation_keywords):
-                    return True
+        station_code = station_code.strip().lower()
+        train_num = train_num.strip()
+        if train_num.isdigit():
+            train_num = str(int(train_num))
 
-        # Also check all text content of the element as fallback
-        all_text = ''.join(element.itertext()).upper()
-        if 'WIJZIGINGTYPE>32' in all_text or any(kw in all_text for kw in ('RIJDT NIET', 'VERVALLEN', 'GEANNULEERD')):
-            return True
+        status_text = (rit_info.findtext('.//RitWijzigingType') or rit_info.findtext('.//TreinStatus') or rit_info.findtext('.//WijzigingType') or rit_info.findtext('.//Status') or '').strip().upper()
+        detail_text = (rit_info.findtext('.//RitWijzigingTekst') or rit_info.findtext('.//Tekst') or rit_info.findtext('.//Text') or '').strip().upper()
 
-        return False
+        is_cancelled = False
+        if status_text.isdigit() and int(status_text) == 32:
+            is_cancelled = True
+        if any(token in status_text for token in ('CANCEL', 'VERVALLEN', 'RIJDETNIET', 'NOTDRIVING', 'DELETED', 'RIJDT NIET')):
+            is_cancelled = True
+        if any(token in detail_text for token in ('RIJDT NIET', 'RIJDETNIET', 'VERVALLEN', 'CANCEL', 'CANCELLED', 'NOTDRIVING', 'DELETED')):
+            is_cancelled = True
+
+        delay_seconds = 0
+        delay_elem = rit_info.findtext('.//VertrekVertraging') or rit_info.findtext('.//Vertraging')
+        if delay_elem:
+            delay_seconds = parse_iso_duration(delay_elem)
+
+        self.db.upsert_delay(train_num, station_code, delay_seconds, is_cancelled)
 
     def process_dvs(self, dvs):
         train_num = dvs.findtext('.//TreinNummer') or dvs.findtext('.//RitId')
@@ -377,62 +377,32 @@ class InfoPlusSubscriber(threading.Thread):
 
         station_code = station_code.strip().lower()
         train_num = train_num.strip()
+        # Normalize to the canonical form without leading zeros. NS/InfoPlus
+        # normally sends unpadded numbers already ("3617"), but this keeps
+        # the daemon consistent with the zero-stripped train_number stored
+        # by ov-trein-dienstregeling.php's IFF import (which otherwise
+        # preserves fixed-width padding like "03617"), regardless of which
+        # side ends up padding in the future.
         if train_num.isdigit():
             train_num = str(int(train_num))
 
-        is_cancelled = self._check_cancellation(dvs)
+        status_text = (dvs.findtext('.//TreinStatus') or dvs.findtext('.//WijzigingType') or '').strip().upper()
+        detail_text = (dvs.findtext('.//Tekst') or dvs.findtext('.//Text') or '').strip().upper()
+
+        is_cancelled = False
+        if status_text.isdigit() and int(status_text) == 32:
+            is_cancelled = True
+        if any(token in status_text for token in ('CANCEL', 'VERVALLEN', 'RIJDETNIET', 'NOTDRIVING', 'DELETED')):
+            is_cancelled = True
+        if any(token in detail_text for token in ('RIJDT NIET', 'RIJDETNIET', 'VERVALLEN', 'CANCEL', 'CANCELLED', 'NOTDRIVING', 'DELETED')):
+            is_cancelled = True
 
         delay_seconds = 0
         delay_elem = dvs.findtext('.//VertrekVertraging') or dvs.findtext('.//Vertraging')
         if delay_elem:
             delay_seconds = parse_iso_duration(delay_elem)
 
-        dest = dvs.findtext('.//EindBestemming/KorteNaam') or dvs.findtext('.//EindBestemming/LangeNaam') or dvs.findtext('.//EindBestemming') or dvs.findtext('.//Bestemming') or ''
-        train_type = dvs.findtext('.//TreinSoort') or dvs.findtext('.//TreinType') or ''
-        dep_time_raw = dvs.findtext('.//VertrekTijd') or dvs.findtext('.//GeplandeVertrekTijd') or ''
-        dep_time = ''
-        if dep_time_raw:
-            try:
-                dt_obj = datetime.fromisoformat(dep_time_raw.replace('Z', '+00:00'))
-                dep_time = dt_obj.strftime('%H:%M')
-            except Exception:
-                dep_time = dep_time_raw[:5] if len(dep_time_raw) >= 5 else dep_time_raw
-
-        is_extra_stop = False
-        for wt in dvs.findall('.//WijzigingType'):
-            wt_text = (wt.text or '').strip()
-            if wt_text == '20' or 'TOEVOEGING' in wt_text.upper():
-                is_extra_stop = True
-                break
-
-        self.db.upsert_delay(train_num, station_code, delay_seconds, is_cancelled, departure_time=dep_time, destination=dest, train_type=train_type, is_extra_stop=is_extra_stop)
-
-    def process_rit(self, rit):
-        train_num = rit.findtext('.//TreinNummer') or rit.findtext('.//RitId') or rit.findtext('.//RitNummer')
-        if not train_num:
-            return
-        train_num = train_num.strip()
-        if train_num.isdigit():
-            train_num = str(int(train_num))
-
-        is_cancelled = self._check_cancellation(rit)
-
-        # Extract stations from RitInfo stop list or single StationCode
-        stations = set()
-        for sc in rit.findall('.//StationCode'):
-            if sc.text:
-                stations.add(sc.text.strip().lower())
-
-        delay_seconds = 0
-        delay_elem = rit.findtext('.//VertrekVertraging') or rit.findtext('.//Vertraging') or rit.findtext('.//Delay')
-        if delay_elem:
-            delay_seconds = parse_iso_duration(delay_elem)
-
-        dest = rit.findtext('.//EindBestemming/KorteNaam') or rit.findtext('.//EindBestemming/LangeNaam') or rit.findtext('.//EindBestemming') or rit.findtext('.//Bestemming') or ''
-        train_type = rit.findtext('.//TreinSoort') or rit.findtext('.//TreinType') or ''
-
-        for station_code in stations:
-            self.db.upsert_delay(train_num, station_code, delay_seconds, is_cancelled, destination=dest, train_type=train_type)
+        self.db.upsert_delay(train_num, station_code, delay_seconds, is_cancelled)
 
 
 def main():
