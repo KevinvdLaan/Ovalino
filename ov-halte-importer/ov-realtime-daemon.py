@@ -123,9 +123,9 @@ class DelayDatabase:
         except Exception:
             self.connect()
 
-    def upsert_delay(self, journey_ref, stop_code, delay_seconds, is_cancelled):
+    def upsert_delay(self, journey_ref, stop_code, delay_seconds, is_cancelled, departure_time='', destination='', train_type='', line_code='', is_extra_stop=False):
         """Insert or update delay record."""
-        if not journey_ref or not stop_code:
+        if not journey_ref:
             return
         with self.lock:
             self.ensure_connection()
@@ -134,14 +134,19 @@ class DelayDatabase:
             try:
                 cursor = self.conn.cursor()
                 sql = f"""
-                    INSERT INTO {self.table_name} (journey_ref, stop_code, delay_seconds, is_cancelled, updated_at)
-                    VALUES (%s, %s, %s, %s, NOW())
+                    INSERT INTO {self.table_name} (journey_ref, stop_code, delay_seconds, is_cancelled, departure_time, destination, train_type, line_code, is_extra_stop, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                     ON DUPLICATE KEY UPDATE
                         delay_seconds = VALUES(delay_seconds),
                         is_cancelled = VALUES(is_cancelled),
+                        departure_time = VALUES(departure_time),
+                        destination = VALUES(destination),
+                        train_type = VALUES(train_type),
+                        line_code = VALUES(line_code),
+                        is_extra_stop = VALUES(is_extra_stop),
                         updated_at = NOW()
                 """
-                cursor.execute(sql, (journey_ref, stop_code, int(delay_seconds), 1 if is_cancelled else 0))
+                cursor.execute(sql, (journey_ref, stop_code or '', int(delay_seconds), 1 if is_cancelled else 0, departure_time or '', destination or '', train_type or '', line_code or '', 1 if is_extra_stop else 0))
                 cursor.close()
             except Exception as e:
                 print(f"[DB Error] upsert failed: {e}")
@@ -382,7 +387,25 @@ class InfoPlusSubscriber(threading.Thread):
         if delay_elem:
             delay_seconds = parse_iso_duration(delay_elem)
 
-        self.db.upsert_delay(train_num, station_code, delay_seconds, is_cancelled)
+        dest = dvs.findtext('.//EindBestemming/KorteNaam') or dvs.findtext('.//EindBestemming/LangeNaam') or dvs.findtext('.//EindBestemming') or dvs.findtext('.//Bestemming') or ''
+        train_type = dvs.findtext('.//TreinSoort') or dvs.findtext('.//TreinType') or ''
+        dep_time_raw = dvs.findtext('.//VertrekTijd') or dvs.findtext('.//GeplandeVertrekTijd') or ''
+        dep_time = ''
+        if dep_time_raw:
+            try:
+                dt_obj = datetime.fromisoformat(dep_time_raw.replace('Z', '+00:00'))
+                dep_time = dt_obj.strftime('%H:%M')
+            except Exception:
+                dep_time = dep_time_raw[:5] if len(dep_time_raw) >= 5 else dep_time_raw
+
+        is_extra_stop = False
+        for wt in dvs.findall('.//WijzigingType'):
+            wt_text = (wt.text or '').strip()
+            if wt_text == '20' or 'TOEVOEGING' in wt_text.upper():
+                is_extra_stop = True
+                break
+
+        self.db.upsert_delay(train_num, station_code, delay_seconds, is_cancelled, departure_time=dep_time, destination=dest, train_type=train_type, is_extra_stop=is_extra_stop)
 
     def process_rit(self, rit):
         train_num = rit.findtext('.//TreinNummer') or rit.findtext('.//RitId') or rit.findtext('.//RitNummer')
@@ -405,8 +428,11 @@ class InfoPlusSubscriber(threading.Thread):
         if delay_elem:
             delay_seconds = parse_iso_duration(delay_elem)
 
+        dest = rit.findtext('.//EindBestemming/KorteNaam') or rit.findtext('.//EindBestemming/LangeNaam') or rit.findtext('.//EindBestemming') or rit.findtext('.//Bestemming') or ''
+        train_type = rit.findtext('.//TreinSoort') or rit.findtext('.//TreinType') or ''
+
         for station_code in stations:
-            self.db.upsert_delay(train_num, station_code, delay_seconds, is_cancelled)
+            self.db.upsert_delay(train_num, station_code, delay_seconds, is_cancelled, destination=dest, train_type=train_type)
 
 
 def main():

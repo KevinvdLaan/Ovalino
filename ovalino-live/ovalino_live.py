@@ -58,6 +58,11 @@ class DelayRecord:
     is_cancelled: bool
     source: str
     updated_at: str
+    departure_time: str = ""
+    destination: str = ""
+    train_type: str = ""
+    line_code: str = ""
+    is_extra_stop: bool = False
 
     def as_dict(self):
         return asdict(self)
@@ -197,9 +202,14 @@ def parse_infoplus_message(raw_bytes: bytes, envelope: str) -> List[DelayRecord]
     now_iso = datetime.now(timezone.utc).isoformat()
 
     journey_ref = None
-    stop_code = None
+    stop_code = ""
     delay_seconds = 0
     is_cancelled = False
+    departure_time = ""
+    destination = ""
+    train_type = ""
+    line_code = ""
+    is_extra_stop = False
 
     delay_tags = (
         'exactevertrekvertraging', 'exacteaankomstvertraging',
@@ -227,8 +237,23 @@ def parse_infoplus_message(raw_bytes: bytes, envelope: str) -> List[DelayRecord]
             lowered = value.lower()
             if value == '32' or any(tok in lowered for tok in ('rijdt niet', 'vervallen', 'cancelled', 'canceled', 'niet gereden', 'nietopgevoerd', 'rijdetniet', 'geannuleerd')):
                 is_cancelled = True
+            if value == '20' or 'toevoeging' in lowered:
+                is_extra_stop = True
+        elif tag in ('eindbestemming', 'bestemming', 'kortenaam', 'langenaam') and not destination:
+            destination = value
+        elif tag in ('treinsoort', 'treintype') and not train_type:
+            train_type = value
+        elif tag in ('vertrektijd', 'geplandevertrektijd') and not departure_time:
+            if 'T' in value:
+                try:
+                    dt_obj = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                    departure_time = dt_obj.strftime('%H:%M')
+                except Exception:
+                    departure_time = value[:5]
+            else:
+                departure_time = value[:5]
 
-    if journey_ref and stop_code:
+    if journey_ref:
         records.append(DelayRecord(
             journey_ref=journey_ref,
             stop_code=stop_code,
@@ -236,6 +261,11 @@ def parse_infoplus_message(raw_bytes: bytes, envelope: str) -> List[DelayRecord]
             is_cancelled=is_cancelled,
             source=envelope,
             updated_at=now_iso,
+            departure_time=departure_time,
+            destination=destination,
+            train_type=train_type,
+            line_code=line_code,
+            is_extra_stop=is_extra_stop,
         ))
 
     return records

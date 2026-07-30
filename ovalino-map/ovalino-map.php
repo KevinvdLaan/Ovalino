@@ -793,40 +793,69 @@ class Ovalino_Map {
 		$departures_by_station = array();
 		$seen_direction_per_station = array();
 
-		// Gebruik alleen de huidige OV-servicedag: de +1 dag-correctie in timestamp_from_service_seconds
-		// (voor ritten na middernacht met dep_sec < 5u) mag maar één keer worden toegepast.
-		// Bij de volgende kalenderdag zou de correctie dubbel tellen en ritten twee dagen vooruit schuiven.
 		$service_date = self::get_service_date_for_timestamp($now);
 
 		$placeholders = implode(',', array_fill(0, count($station_codes), '%s'));
 		$params = array_merge($station_codes);
 
+		// 1. Haal recente realtime vertragingen/uitval uit de lokale database op in 1 snelle query (<2ms)
+		$delays = array();
+		$realtime_table = $wpdb->prefix . 'ovhi_realtime_delays';
+		if ((bool) $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $realtime_table))) {
+			$one_hour_ago = date('Y-m-d H:i:s', $now - 3600);
+			$delay_rows = $wpdb->get_results(
+				$wpdb->prepare("SELECT journey_ref, stop_code, delay_seconds, is_cancelled FROM $realtime_table WHERE updated_at >= %s", $one_hour_ago),
+				ARRAY_A
+			);
+			if (!empty($delay_rows)) {
+				foreach ($delay_rows as $dr) {
+					$jref = trim((string)$dr['journey_ref']);
+					$clean_jref = ltrim($jref, '0');
+					$scode = strtolower(trim((string)$dr['stop_code']));
+					if ($scode !== '') {
+						$delays[$jref . '|' . $scode] = $dr;
+						$delays[$clean_jref . '|' . $scode] = $dr;
+					} else {
+						if (!isset($delays[$jref]) || (!empty($dr['is_cancelled']) && empty($delays[$jref]['is_cancelled']))) {
+							$delays[$jref] = $dr;
+							$delays[$clean_jref] = $dr;
+						}
+					}
+				}
+			}
+		}
+
+		// 2. Haal geplande vertrekken op voor alle gevraagde stations
 		$sql = "
 			SELECT so.station_code,
 			       d.train_type, d.line_code, d.destination_name as destination, so.departure_seconds as dep_sec, j.direction_ref,
-			       j.journey_ref, j.train_number,
-			       rd.delay_seconds, rd.is_cancelled
+			       j.journey_ref, j.train_number
 			FROM " . self::table('ovtd', 'journey_stops') . " so
 			INNER JOIN " . self::table('ovtd', 'journeys') . " j ON j.journey_ref = so.journey_ref
 			INNER JOIN " . self::table('ovtd', 'directions') . " d ON d.direction_ref = j.direction_ref
-			LEFT JOIN " . $wpdb->prefix . "ovhi_realtime_delays rd
-				ON (rd.journey_ref = j.journey_ref OR rd.journey_ref = j.train_number OR rd.journey_ref = TRIM(LEADING '0' FROM j.train_number))
-				AND rd.stop_code = so.station_code
 			WHERE so.station_code IN ($placeholders)
 			ORDER BY so.station_code, so.departure_seconds ASC
 		";
 
 		$results = $wpdb->get_results($wpdb->prepare($sql, ...$params), ARRAY_A);
 
-		// Single-pass NS API fallback voor stations zonder DB match indien OV_Trein_Dienstregeling aanwezig is
-		$ns_delays = array();
-		if (class_exists('OV_Trein_Dienstregeling') && method_exists('OV_Trein_Dienstregeling', 'fetch_ns_api_delays')) {
-			$ns_delays = OV_Trein_Dienstregeling::fetch_ns_api_delays($station_codes);
+		$hidden_directions = array();
+		if (class_exists('OV_Trein_Dienstregeling') && method_exists('OV_Trein_Dienstregeling', 'get_hidden_directions')) {
+			$hidden_directions = OV_Trein_Dienstregeling::get_hidden_directions();
+		} else {
+			$hidden_opt = get_option('ovtd_hidden_directions', array());
+			$hidden_directions = is_array($hidden_opt) ? array_values(array_filter($hidden_opt)) : array();
 		}
 
+		$seen_train_keys = array();
+
 		foreach ($results as $row) {
-			$station_code = $row['station_code'];
+			$station_code = strtolower($row['station_code']);
 			$direction_ref = $row['direction_ref'];
+
+			if (!empty($hidden_directions) && in_array($direction_ref, $hidden_directions, true)) {
+				continue;
+			}
 
 			if (!isset($departures_by_station[$station_code])) {
 				$departures_by_station[$station_code] = array();
@@ -839,24 +868,33 @@ class Ovalino_Map {
 
 			$ts = self::timestamp_from_service_seconds($service_date, (int)$row['dep_sec']);
 
-			$delay_seconds = isset($row['delay_seconds']) ? (int) $row['delay_seconds'] : 0;
-			$is_cancelled = !empty($row['is_cancelled']);
+			$raw_tnum = isset($row['train_number']) ? trim((string) $row['train_number']) : '';
+			$clean_tnum = ltrim($raw_tnum, '0');
+			$j_ref = isset($row['journey_ref']) ? trim((string) $row['journey_ref']) : '';
+			$clean_jref = ltrim($j_ref, '0');
 
-			// Indien geen DB match, controleer NS API resultaten
-			if ($delay_seconds === 0 && !$is_cancelled && !empty($ns_delays)) {
-				$clean_st = strtolower($station_code);
-				$raw_tnum = isset($row['train_number']) ? trim((string) $row['train_number']) : '';
-				$clean_tnum = ltrim($raw_tnum, '0');
-				$ns_candidates = array(
-					$raw_tnum . '|' . $clean_st,
-					$clean_tnum . '|' . $clean_st,
-					$raw_tnum,
-					$clean_tnum,
-				);
-				foreach ($ns_candidates as $cand) {
-					if ($cand !== '' && isset($ns_delays[$cand]) && is_array($ns_delays[$cand])) {
-						$delay_seconds = (int) $ns_delays[$cand]['delay_seconds'];
-						$is_cancelled = !empty($ns_delays[$cand]['is_cancelled']);
+			$seen_train_keys[$station_code . '|' . $raw_tnum] = true;
+			$seen_train_keys[$station_code . '|' . $clean_tnum] = true;
+
+			$candidates = array(
+				$raw_tnum . '|' . $station_code,
+				$clean_tnum . '|' . $station_code,
+				$j_ref . '|' . $station_code,
+				$clean_jref . '|' . $station_code,
+				$raw_tnum,
+				$clean_tnum,
+				$j_ref,
+				$clean_jref,
+			);
+
+			$delay_seconds = 0;
+			$is_cancelled = false;
+
+			foreach ($candidates as $cand) {
+				if ($cand !== '' && isset($delays[$cand]) && is_array($delays[$cand])) {
+					$delay_seconds = (int) $delays[$cand]['delay_seconds'];
+					$is_cancelled = !empty($delays[$cand]['is_cancelled']);
+					if ($is_cancelled || $delay_seconds !== 0) {
 						break;
 					}
 				}
@@ -887,6 +925,57 @@ class Ovalino_Map {
 					'timestamp' => $ts
 				);
 				$seen_direction_per_station[$station_code][] = $direction_ref;
+			}
+		}
+
+		// 3. Voeg eventuele extra stops toe uit realtime_delays
+		if ((bool) $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $realtime_table))) {
+			$one_hour_ago = date('Y-m-d H:i:s', $now - 3600);
+			$extra_rows = $wpdb->get_results(
+				$wpdb->prepare("SELECT journey_ref, stop_code, delay_seconds, is_cancelled, departure_time, destination, train_type, line_code FROM $realtime_table WHERE stop_code IN ($placeholders) AND (is_extra_stop = 1 OR departure_time <> '') AND updated_at >= %s", ...array_merge($params, array($one_hour_ago))),
+				ARRAY_A
+			);
+			if (!empty($extra_rows)) {
+				foreach ($extra_rows as $erow) {
+					$st_code = strtolower(trim((string)$erow['stop_code']));
+					$ejref = trim((string)$erow['journey_ref']);
+					if (isset($seen_train_keys[$st_code . '|' . $ejref]) || isset($seen_train_keys[$st_code . '|' . ltrim($ejref, '0')])) {
+						continue;
+					}
+					if (empty($erow['departure_time'])) {
+						continue;
+					}
+					$ts = strtotime($erow['departure_time']);
+					if (!$ts) {
+						$timezone = wp_timezone();
+						$dt_cand = DateTimeImmutable::createFromFormat('H:i', substr($erow['departure_time'], 0, 5), $timezone);
+						if ($dt_cand) {
+							$ts = $dt_cand->getTimestamp();
+						}
+					}
+					if ($ts && $ts >= $now && $ts <= $two_hours_later) {
+						$timezone = wp_timezone();
+						$dt = new DateTimeImmutable('@' . $ts);
+						$dt = $dt->setTimezone($timezone);
+						$line_badge = class_exists('OV_Trein_Dienstregeling')
+							? OV_Trein_Dienstregeling::get_line_badge($erow['train_type'], $erow['line_code'])
+							: (!empty($erow['train_type']) ? $erow['train_type'] : 'Trein');
+
+						if (!isset($departures_by_station[$st_code])) {
+							$departures_by_station[$st_code] = array();
+						}
+						$departures_by_station[$st_code][] = array(
+							'line' => $line_badge,
+							'destination' => !empty($erow['destination']) ? $erow['destination'] : 'Trein',
+							'time' => $dt->format('H:i') . ' (extra stop)',
+							'delay_seconds' => (int)$erow['delay_seconds'],
+							'is_cancelled' => !empty($erow['is_cancelled']),
+							'lineRef' => $ejref,
+							'direction' => $ejref,
+							'timestamp' => $ts
+						);
+					}
+				}
 			}
 		}
 
@@ -923,6 +1012,14 @@ class Ovalino_Map {
 
 	private static function get_train_directions($station_code) {
 		global $wpdb;
+		$hidden_directions = array();
+		if (class_exists('OV_Trein_Dienstregeling') && method_exists('OV_Trein_Dienstregeling', 'get_hidden_directions')) {
+			$hidden_directions = OV_Trein_Dienstregeling::get_hidden_directions();
+		} else {
+			$hidden_opt = get_option('ovtd_hidden_directions', array());
+			$hidden_directions = is_array($hidden_opt) ? array_values(array_filter($hidden_opt)) : array();
+		}
+
 		$sql = "
 			SELECT DISTINCT d.direction_ref as ref, d.destination_name as label, d.train_type, d.line_code
 			FROM " . self::table('ovtd', 'journey_stops') . " js
@@ -931,6 +1028,12 @@ class Ovalino_Map {
 			WHERE js.station_code = %s
 		";
 		$rows = $wpdb->get_results($wpdb->prepare($sql, $station_code), ARRAY_A);
+
+		if (!empty($hidden_directions)) {
+			$rows = array_values(array_filter($rows, function($row) use ($hidden_directions) {
+				return !in_array($row['ref'], $hidden_directions, true);
+			}));
+		}
 
 		// Bepaal per richting de lijnbadge op dezelfde manier als OV Trein
 		// Dienstregeling: lijncode (bv. "RSx") indien bekend, anders het
