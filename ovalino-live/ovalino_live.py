@@ -214,16 +214,18 @@ def parse_infoplus_message(raw_bytes: bytes, envelope: str) -> List[DelayRecord]
         if not value:
             continue
         if tag in ('treinnummer', 'logischeritnummer', 'ritnummer', 'ritid', 'trainid', 'journeyref') and not journey_ref:
-            journey_ref = value
+            journey_ref = value.strip()
+            if journey_ref.isdigit():
+                journey_ref = str(int(journey_ref))
         elif tag in ('stationcode', 'stopcode', 'haltecode') and not stop_code:
             stop_code = value.lower()
         elif tag in delay_tags:
             parsed_d = parse_iso_duration(value)
             if parsed_d != 0 or delay_seconds == 0:
                 delay_seconds = parsed_d
-        elif tag in ('treinstatus', 'wijzigingtype', 'status', 'vervallen'):
+        elif tag in ('wijzigingtype', 'tekst', 'treinstatus', 'status', 'vervallen', 'oorzaakkort'):
             lowered = value.lower()
-            if any(tok in lowered for tok in ('vervallen', 'cancelled', 'canceled', 'niet gereden', 'nietopgevoerd', 'rijdetniet')):
+            if value == '32' or any(tok in lowered for tok in ('rijdt niet', 'vervallen', 'cancelled', 'canceled', 'niet gereden', 'nietopgevoerd', 'rijdetniet', 'geannuleerd')):
                 is_cancelled = True
 
     if journey_ref and stop_code:
