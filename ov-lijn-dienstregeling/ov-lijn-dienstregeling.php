@@ -827,7 +827,10 @@ class OV_Lijn_Dienstregeling {
 								if (!empty($stop['quay_code'])) {
 									$delay_key = self::get_realtime_delay_map_key($journey['journey_ref'], $stop['quay_code']);
 									if ($delay_key !== '' && isset($realtime_delay_map[$delay_key])) {
-										$delay = $realtime_delay_map[$delay_key];
+										$scheduled_ts = self::timestamp_from_service_seconds($service_date, (int) $journey['departure_seconds'] + (int) $offsets[$key]);
+										if ($scheduled_ts <= (current_time('timestamp') + 2 * HOUR_IN_SECONDS)) {
+											$delay = $realtime_delay_map[$delay_key];
+										}
 									}
 								}
 								$time_html = $time !== '' ? self::format_schedule_time($time, $delay['delay_seconds'], $delay['is_cancelled']) : '';
@@ -839,15 +842,15 @@ class OV_Lijn_Dienstregeling {
 				</div>
 				<button type="button" class="ovld-scroll ovld-scroll-right" aria-label="Scroll dienstregeling naar rechts" data-ovld-scroll="1">›</button>
 			</div>
-			<?php echo self::render_mobile_cards($journeys, $stops, $offsets, $line, $background, $text_color, $realtime_delay_map); ?>
+			<?php echo self::render_mobile_cards($journeys, $stops, $offsets, $line, $background, $text_color, $realtime_delay_map, $service_date); ?>
 			<?php echo self::render_footnotes($footnote_map); ?>
 		</div>
-		<?php echo self::render_print_schedule($journeys, $stops, $offsets, $line, $background, $text_color, $route, $valid_date_range, $variant_label, $footnote_map, $link_map, $realtime_delay_map); ?>
+		<?php echo self::render_print_schedule($journeys, $stops, $offsets, $line, $background, $text_color, $route, $valid_date_range, $variant_label, $footnote_map, $link_map, $realtime_delay_map, $service_date); ?>
 		<?php
 		return ob_get_clean();
 	}
 
-	private static function render_print_schedule(array $journeys, array $stops, array $offsets, array $line, $background, $text_color, $route, $valid_date_range, $variant_label, array $footnote_map, array $link_map, array $realtime_delay_map = array()) {
+	private static function render_print_schedule(array $journeys, array $stops, array $offsets, array $line, $background, $text_color, $route, $valid_date_range, $variant_label, array $footnote_map, array $link_map, array $realtime_delay_map = array(), $service_date = '') {
 		if (empty($journeys) || empty($stops)) {
 			return '';
 		}
@@ -901,7 +904,10 @@ class OV_Lijn_Dienstregeling {
 								if (!empty($stop['quay_code'])) {
 									$delay_key = self::get_realtime_delay_map_key($journey['journey_ref'], $stop['quay_code']);
 									if ($delay_key !== '' && isset($realtime_delay_map[$delay_key])) {
-										$delay = $realtime_delay_map[$delay_key];
+										$scheduled_ts = self::timestamp_from_service_seconds($service_date, (int) $journey['departure_seconds'] + (int) $offsets[$key]);
+										if ($scheduled_ts <= (current_time('timestamp') + 2 * HOUR_IN_SECONDS)) {
+											$delay = $realtime_delay_map[$delay_key];
+										}
 									}
 								}
 								$time_html = $time !== '' ? self::format_schedule_time($time, $delay['delay_seconds'], $delay['is_cancelled']) : '';
@@ -925,7 +931,7 @@ class OV_Lijn_Dienstregeling {
 		return ob_get_clean();
 	}
 
-	private static function render_mobile_cards(array $journeys, array $stops, array $offsets, array $line, $background, $text_color, array $realtime_delay_map = array()) {
+	private static function render_mobile_cards(array $journeys, array $stops, array $offsets, array $line, $background, $text_color, array $realtime_delay_map = array(), $service_date = '') {
 		if (empty($journeys) || empty($stops)) {
 			return '';
 		}
@@ -944,17 +950,21 @@ class OV_Lijn_Dienstregeling {
 					if (!isset($offsets[$key])) {
 						continue;
 					}
-					$delay = array('delay_seconds' => 0, 'is_cancelled' => false);
-					if (!empty($stop['quay_code'])) {
-						$delay_key = self::get_realtime_delay_map_key($journey['journey_ref'], $stop['quay_code']);
-						if ($delay_key !== '' && isset($realtime_delay_map[$delay_key])) {
-							$delay = $realtime_delay_map[$delay_key];
+						$delay = array('delay_seconds' => 0, 'is_cancelled' => false);
+						if (!empty($stop['quay_code'])) {
+							$delay_key = self::get_realtime_delay_map_key($journey['journey_ref'], $stop['quay_code']);
+							if ($delay_key !== '' && isset($realtime_delay_map[$delay_key])) {
+								// Only apply realtime delay if the scheduled departure is within the next 2 hours
+								$scheduled_ts = self::timestamp_from_service_seconds($service_date, (int) $journey['departure_seconds'] + (int) $offsets[$key]);
+								if ($scheduled_ts <= (current_time('timestamp') + 2 * HOUR_IN_SECONDS)) {
+									$delay = $realtime_delay_map[$delay_key];
+								}
+							}
 						}
-					}
-					$full_rows[] = array(
-						'name' => $stop['stop_name'] !== '' ? $stop['stop_name'] : $stop['scheduled_stop_point_ref'],
-						'time' => self::format_schedule_time(self::format_seconds((int) $journey['departure_seconds'] + (int) $offsets[$key]), $delay['delay_seconds'], $delay['is_cancelled']),
-					);
+						$full_rows[] = array(
+							'name' => $stop['stop_name'] !== '' ? $stop['stop_name'] : $stop['scheduled_stop_point_ref'],
+							'time' => self::format_schedule_time(self::format_seconds((int) $journey['departure_seconds'] + (int) $offsets[$key]), $delay['delay_seconds'], $delay['is_cancelled']),
+						);
 				}
 				if (empty($full_rows)) {
 					continue;
@@ -1702,6 +1712,20 @@ class OV_Lijn_Dienstregeling {
 			return $seconds + DAY_IN_SECONDS;
 		}
 		return $seconds;
+	}
+
+	/**
+	 * Convert a service-day seconds value into a UNIX timestamp for the given service_date
+	 * taking into account the service-day boundary (e.g. times before 05:00 belong to the next calendar day).
+	 */
+	private static function timestamp_from_service_seconds($service_date, $seconds) {
+		$timezone = wp_timezone();
+		$midnight = new DateTimeImmutable($service_date . ' 00:00:00', $timezone);
+		$dt = $midnight->modify('+' . (int) $seconds . ' seconds');
+		if ((int) $seconds < self::SERVICE_DAY_START_SECONDS) {
+			$dt = $dt->modify('+1 day');
+		}
+		return $dt->getTimestamp();
 	}
 
 	private static function format_seconds($seconds) {
