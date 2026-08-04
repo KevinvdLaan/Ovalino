@@ -5,7 +5,7 @@ import logging
 import os
 import re
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
 import zmq
@@ -58,6 +58,7 @@ class DelayRecord:
     is_cancelled: bool
     source: str
     updated_at: str
+    expected_time: Optional[str] = None
 
     def as_dict(self):
         return asdict(self)
@@ -178,10 +179,78 @@ def parse_iso_duration(duration_str: str) -> int:
     return -total if is_neg else total
 
 
+def parse_datetime_value(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    value = value.strip()
+    if value == '':
+        return None
+
+    if value.isdigit() or (value.startswith('-') and value[1:].isdigit()):
+        try:
+            timestamp = int(value)
+        except ValueError:
+            return None
+        if len(value) == 13:
+            timestamp = int(round(timestamp / 1000))
+        try:
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    if value.endswith('Z'):
+        value = value[:-1] + '+00:00'
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        pass
+
+    if re.match(r'^\d{2}:\d{2}(?::\d{2})?$', value):
+        parts = value.split(':')
+        try:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = int(parts[2]) if len(parts) > 2 else 0
+        except ValueError:
+            return None
+        try:
+            today = datetime.now(timezone.utc).date()
+            return datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc).replace(
+                hour=hours, minute=minutes, second=seconds,
+            )
+        except ValueError:
+            return None
+
+    return None
+
+
+def format_datetime_value(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def add_seconds_to_datetime_string(value: str, seconds: int) -> Optional[str]:
+    dt = parse_datetime_value(value)
+    if dt is None:
+        return None
+    return format_datetime_value(dt + timedelta(seconds=seconds))
+
+
 def parse_infoplus_message(raw_bytes: bytes, envelope: str) -> List[DelayRecord]:
     records: List[DelayRecord] = []
     if not raw_bytes:
         return records
+
+    def extract_element_values(element):
+        values = []
+        if element.text and element.text.strip():
+            values.append(element.text.strip())
+        for attr_value in element.attrib.values():
+            if isinstance(attr_value, str) and attr_value.strip():
+                values.append(attr_value.strip())
+        return values
 
     try:
         root = etree.fromstring(raw_bytes)
@@ -200,33 +269,109 @@ def parse_infoplus_message(raw_bytes: bytes, envelope: str) -> List[DelayRecord]
     stop_code = None
     delay_seconds = 0
     is_cancelled = False
+    expected_time = None
+    scheduled_time = None
 
+    journey_ref_tags = ('treinnummer', 'logischeritnummer', 'ritnummer', 'ritid', 'trainid', 'journeyref', 'servicejourneyref', 'vehiclejourneyref')
+    stop_code_tags = ('stationcode', 'stopcode', 'haltecode')
     delay_tags = (
         'exactevertrekvertraging', 'exacteaankomstvertraging',
         'gedemptevertrekvertraging', 'gedempteaankomstvertraging',
         'presentatievertrekvertraging', 'presentatieaankomstvertraging',
         'vertrekvertraging', 'aankomstvertraging', 'vertraging', 'delay'
     )
+    expected_time_tags = (
+        'expecteddeparturetime', 'expecteddeparturetimestamp', 'expectedarrivaltime', 'expectedarrivaltimestamp',
+        'actualdeparturetime', 'actualarrivaltime', 'realtimedeparture', 'realtimearrival',
+        'estimatedtime', 'expectedtime', 'vertrektijd', 'aankomsttijd',
+    )
+    scheduled_time_tags = (
+        'targetdeparturetime', 'targetdeparturetimestamp', 'targetarrivaltime', 'targetarrivaltimestamp',
+        'planneddeparturetime', 'planneddeparturetimestamp', 'plannedarrivaltime', 'plannedarrivaltimestamp',
+        'scheduleddeparturetime', 'scheduleddeparturetimestamp', 'scheduledarrivaltime', 'scheduledarrivaltimestamp',
+        'departuretime', 'arrivaltime', 'vertrektijd', 'aankomsttijd',
+    )
+    status_tags = ('treinstatus', 'wijzigingtype', 'status', 'vervallen', 'tekst', 'infostatus', 'ritstopstatus', 'tripstopstatus')
+    cancel_tokens = ('vervallen', 'cancelled', 'canceled', 'niet gereden', 'nietgereden', 'rijdetniet', 'rijdt niet', 'notdriving', 'deleted', 'nietopgevoerd')
+    infoplus_cancel_codes = (25, 32, 34, 39, 44)
 
     for element in root.iter():
         tag = strip_namespace(element.tag)
-        value = (element.text or '').strip()
-        if not value:
-            continue
-        if tag in ('treinnummer', 'logischeritnummer', 'ritnummer', 'ritid', 'trainid', 'journeyref') and not journey_ref:
-            journey_ref = value
-        elif tag in ('stationcode', 'stopcode', 'haltecode') and not stop_code:
-            stop_code = value.lower()
-        elif tag in delay_tags:
-            parsed_d = parse_iso_duration(value)
-            if parsed_d != 0 or delay_seconds == 0:
-                delay_seconds = parsed_d
-        elif tag in ('treinstatus', 'wijzigingtype', 'status', 'vervallen', 'tekst'):
+        values = extract_element_values(element)
+
+        if tag in journey_ref_tags and not journey_ref and values:
+            journey_ref = values[0]
+        elif tag in stop_code_tags and not stop_code and values:
+            stop_code = values[0].lower()
+
+        if tag in delay_tags:
+            for value in values:
+                parsed_d = parse_iso_duration(value)
+                if parsed_d != 0 or delay_seconds == 0:
+                    delay_seconds = parsed_d
+        elif tag in expected_time_tags:
+            for value in values:
+                parsed_dt = parse_datetime_value(value)
+                if parsed_dt is not None:
+                    expected_time = format_datetime_value(parsed_dt)
+                    break
+        elif tag in scheduled_time_tags:
+            for value in values:
+                parsed_dt = parse_datetime_value(value)
+                if parsed_dt is not None and scheduled_time is None:
+                    scheduled_time = parsed_dt
+                    break
+
+        if tag in status_tags:
+            for value in values:
+                lowered = value.lower()
+                if lowered.isdigit() and int(lowered) in infoplus_cancel_codes:
+                    is_cancelled = True
+                if any(tok in lowered for tok in cancel_tokens):
+                    is_cancelled = True
+
+        for value in values:
             lowered = value.lower()
-            if lowered.isdigit() and int(lowered) == 32:
+            if lowered.isdigit() and int(lowered) in infoplus_cancel_codes:
                 is_cancelled = True
-            if any(tok in lowered for tok in ('vervallen', 'cancelled', 'canceled', 'niet gereden', 'nietopgevoerd', 'rijdetniet', 'rijdt niet', 'notdriving', 'deleted')):
+            if any(tok in lowered for tok in cancel_tokens):
                 is_cancelled = True
+
+        for attr_name, attr_value in element.attrib.items():
+            attr_tag = strip_namespace(attr_name)
+            attr_value = attr_value.strip()
+            if not attr_value:
+                continue
+
+            if attr_tag in journey_ref_tags and not journey_ref:
+                journey_ref = attr_value
+            elif attr_tag in stop_code_tags and not stop_code:
+                stop_code = attr_value.lower()
+
+            if attr_tag in delay_tags:
+                parsed_d = parse_iso_duration(attr_value)
+                if parsed_d != 0 or delay_seconds == 0:
+                    delay_seconds = parsed_d
+            elif attr_tag in expected_time_tags:
+                parsed_dt = parse_datetime_value(attr_value)
+                if parsed_dt is not None:
+                    expected_time = format_datetime_value(parsed_dt)
+            elif attr_tag in scheduled_time_tags:
+                parsed_dt = parse_datetime_value(attr_value)
+                if parsed_dt is not None and scheduled_time is None:
+                    scheduled_time = parsed_dt
+
+            lowered = attr_value.lower()
+            if lowered.isdigit() and int(lowered) in infoplus_cancel_codes:
+                is_cancelled = True
+            if any(tok in lowered for tok in cancel_tokens):
+                is_cancelled = True
+
+    if expected_time is None and scheduled_time is not None:
+        if delay_seconds != 0:
+            expected_time = format_datetime_value(scheduled_time + timedelta(seconds=delay_seconds))
+        else:
+            expected_time = format_datetime_value(scheduled_time)
 
     if journey_ref and stop_code:
         records.append(DelayRecord(
@@ -236,6 +381,7 @@ def parse_infoplus_message(raw_bytes: bytes, envelope: str) -> List[DelayRecord]
             is_cancelled=is_cancelled,
             source=envelope,
             updated_at=now_iso,
+            expected_time=expected_time,
         ))
 
     return records
@@ -255,13 +401,42 @@ def parse_bison_kv17_message(payload: str, envelope: str) -> List[DelayRecord]:
     stop_code = fields.get('stop_code') or fields.get('stopcode') or fields.get('station_code')
     delay_seconds = 0
     is_cancelled = False
+    expected_time = None
+    scheduled_time = None
 
     if journey_ref and stop_code:
         raw_delay = fields.get('delay_seconds') or fields.get('delay') or fields.get('lateness')
         if raw_delay:
             delay_seconds = parse_iso_duration(raw_delay)
+
+        expected_time_raw = (fields.get('expected_time') or fields.get('expectedtime') or fields.get('expected_departure_time') or
+                             fields.get('expectedarrival') or fields.get('expectedarrivaltime') or fields.get('expectedarrival_timestamp') or
+                             fields.get('expecteddeparturetime') or fields.get('expecteddeparturetimestamp') or
+                             fields.get('actualdeparturetime') or fields.get('actualarrivaltime') or fields.get('estimatedtime'))
+        if expected_time_raw:
+            parsed_dt = parse_datetime_value(expected_time_raw)
+            if parsed_dt is not None:
+                expected_time = format_datetime_value(parsed_dt)
+
+        scheduled_time_raw = (fields.get('target_departure_time') or fields.get('targetdeparturetime') or fields.get('target_departure_timestamp') or fields.get('targetdeparturetimestamp') or
+                              fields.get('target_arrival_time') or fields.get('targetarrivaltime') or fields.get('target_arrival_timestamp') or fields.get('targetarrivaltimestamp') or
+                              fields.get('planneddeparturetime') or fields.get('planneddeparturetimestamp') or fields.get('plannedarrivaltime') or fields.get('plannedarrivaltimestamp') or
+                              fields.get('scheduleddeparturetime') or fields.get('scheduleddeparturetimestamp') or fields.get('scheduledarrivaltime') or fields.get('scheduledarrivaltimestamp'))
+        if scheduled_time_raw:
+            parsed_dt = parse_datetime_value(scheduled_time_raw)
+            if parsed_dt is not None:
+                scheduled_time = parsed_dt
+
+        if expected_time is None and scheduled_time is not None:
+            if delay_seconds != 0:
+                expected_time = format_datetime_value(scheduled_time + timedelta(seconds=delay_seconds))
+            else:
+                expected_time = format_datetime_value(scheduled_time)
+
         status = fields.get('status', '').lower()
-        if any(tok in status for tok in ('cancelled', 'canceled', 'vervallen', 'rijdetniet')):
+        if status.isdigit() and int(status) in (25, 32, 39, 44):
+            is_cancelled = True
+        if any(tok in status for tok in ('cancelled', 'canceled', 'vervallen', 'rijdetniet', 'rijdt niet', 'deleted')):
             is_cancelled = True
 
         records.append(DelayRecord(
@@ -271,6 +446,7 @@ def parse_bison_kv17_message(payload: str, envelope: str) -> List[DelayRecord]:
             is_cancelled=is_cancelled,
             source=envelope,
             updated_at=datetime.now(timezone.utc).isoformat(),
+            expected_time=expected_time,
         ))
 
     return records
@@ -346,6 +522,25 @@ def parse_kv78_message(payload: str, envelope: str) -> List[DelayRecord]:
         elif user_stop.startswith('NL:Q:'):
             stops.append(user_stop[5:])
 
+        expected_arr = row_value(row, ['ExpectedArrivalTime', 'ExpectedArrivalTime'])
+        expected_time = None
+        if expected_dep:
+            parsed_dt = parse_datetime_value(expected_dep)
+            if parsed_dt is not None:
+                expected_time = format_datetime_value(parsed_dt)
+            else:
+                expected_time = expected_dep
+        elif expected_arr:
+            parsed_dt = parse_datetime_value(expected_arr)
+            if parsed_dt is not None:
+                expected_time = format_datetime_value(parsed_dt)
+            else:
+                expected_time = expected_arr
+        elif target_dep and delay_seconds != 0:
+            parsed_dt = parse_datetime_value(target_dep)
+            if parsed_dt is not None:
+                expected_time = format_datetime_value(parsed_dt + timedelta(seconds=delay_seconds))
+
         for ref in refs:
             for st in stops:
                 records.append(DelayRecord(
@@ -355,6 +550,7 @@ def parse_kv78_message(payload: str, envelope: str) -> List[DelayRecord]:
                     is_cancelled=is_cancelled,
                     source=envelope,
                     updated_at=now_iso,
+                    expected_time=expected_time,
                 ))
 
     for raw_line in payload.splitlines():

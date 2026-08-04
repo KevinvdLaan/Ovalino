@@ -123,8 +123,11 @@ class DelayDatabase:
         except Exception:
             self.connect()
 
-    def upsert_delay(self, journey_ref, stop_code, delay_seconds, is_cancelled):
-        """Insert or update delay record."""
+    def upsert_delay(self, journey_ref, stop_code, delay_seconds, is_cancelled, expected_time=None):
+        """Insert or update delay record.
+
+        expected_time should be a string in 'YYYY-MM-DD HH:MM:SS' format or None.
+        """
         if not journey_ref or not stop_code:
             return
         with self.lock:
@@ -134,14 +137,16 @@ class DelayDatabase:
             try:
                 cursor = self.conn.cursor()
                 sql = f"""
-                    INSERT INTO {self.table_name} (journey_ref, stop_code, delay_seconds, is_cancelled, updated_at)
-                    VALUES (%s, %s, %s, %s, NOW())
+                    INSERT INTO {self.table_name} (journey_ref, stop_code, delay_seconds, is_cancelled, expected_time, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, NOW())
                     ON DUPLICATE KEY UPDATE
                         delay_seconds = VALUES(delay_seconds),
                         is_cancelled = VALUES(is_cancelled),
+                        expected_time = VALUES(expected_time),
                         updated_at = NOW()
                 """
-                cursor.execute(sql, (journey_ref, stop_code, int(delay_seconds), 1 if is_cancelled else 0))
+                params = (journey_ref, stop_code, int(delay_seconds), 1 if is_cancelled else 0, expected_time)
+                cursor.execute(sql, params)
                 cursor.close()
             except Exception as e:
                 print(f"[DB Error] upsert failed: {e}")
@@ -177,6 +182,34 @@ def parse_iso_duration(duration_str):
     minutes = int(match.group(2) or 0)
     seconds = int(match.group(3) or 0)
     return hours * 3600 + minutes * 60 + seconds
+
+
+def strip_namespace(tag):
+    if tag is None:
+        return ''
+    if '}' in tag:
+        return tag.split('}', 1)[1]
+    return tag
+
+
+def find_text_any(element, tag_names):
+    """Return the first non-empty descendant text or matching attribute for any of the specified tags."""
+    normalized_tags = {name.lower() for name in tag_names}
+    for child in element.iter():
+        tag_name = strip_namespace(child.tag).lower()
+        if tag_name in normalized_tags:
+            text = child.text or ''
+            if text.strip():
+                return text.strip()
+        for attr_name, attr_value in child.attrib.items():
+            if attr_name.lower() in normalized_tags and attr_value.strip():
+                return attr_value.strip()
+    return ''
+
+
+def find_elements_by_names(root, tag_names):
+    normalized_tags = {name.lower() for name in tag_names}
+    return [el for el in root.iter() if strip_namespace(el.tag).lower() in normalized_tags]
 
 
 class KV78Subscriber(threading.Thread):
@@ -243,14 +276,22 @@ class KV78Subscriber(threading.Thread):
         target_dep = row.get("TargetDepartureTime") or row.get("TargetArrivalTime") or ""
         expected_dep = row.get("ExpectedDepartureTime") or row.get("ExpectedArrivalTime") or ""
 
+        if isinstance(user_stop, str):
+            user_stop = user_stop.strip()
+            m = re.match(r'^(?:nl:q:)(\d+)$', user_stop, re.IGNORECASE)
+            if m:
+                user_stop = f"NL:Q:{m.group(1)}"
+
         if not user_stop or not journey_num:
             return
 
         is_cancelled = status in ("CANCEL", "CANCELLED", "DELETED", "NOTDRIVING")
         delay_seconds = 0
 
+        expected_time = None
         if target_dep and expected_dep:
             try:
+                # target_dep/expected_dep are usually time strings HH:MM:SS
                 fmt = "%H:%M:%S"
                 t_dt = datetime.strptime(target_dep[:8], fmt)
                 e_dt = datetime.strptime(expected_dep[:8], fmt)
@@ -259,6 +300,10 @@ class KV78Subscriber(threading.Thread):
                     delay_seconds += 86400
                 elif delay_seconds > 43200:
                     delay_seconds -= 86400
+                # derive expected_time as today + expected_dep
+                today = datetime.now()
+                exp_dt = today.replace(hour=e_dt.hour, minute=e_dt.minute, second=e_dt.second, microsecond=0)
+                expected_time = exp_dt.strftime('%Y-%m-%d %H:%M:%S')
             except Exception:
                 pass
 
@@ -283,14 +328,15 @@ class KV78Subscriber(threading.Thread):
         journey_refs.add(str(journey_num))
 
         for journey_ref in journey_refs:
-            self.db.upsert_delay(journey_ref, user_stop, delay_seconds, is_cancelled)
+            self.db.upsert_delay(journey_ref, user_stop, delay_seconds, is_cancelled, expected_time)
 
             if user_stop.isdigit():
                 self.db.upsert_delay(
                     journey_ref,
                     "NL:Q:" + user_stop,
                     delay_seconds,
-                    is_cancelled
+                    is_cancelled,
+                    expected_time
                 )
 
 
@@ -300,6 +346,27 @@ class InfoPlusSubscriber(threading.Thread):
         super().__init__(daemon=True)
         self.endpoint = endpoint
         self.db = db
+        # Attempt to load configured InfoPlus cancellation codes from the plugin
+        self.infoplus_cancel_codes = set((25, 32, 34, 39, 44))
+        try:
+            plugin_dir = os.path.dirname(__file__)
+            codes_file = os.path.join(plugin_dir, 'infoplus_cancel_codes.json')
+            if os.path.exists(codes_file):
+                import json
+                with open(codes_file, 'r', encoding='utf-8') as fh:
+                    data = json.load(fh)
+                    if isinstance(data, list):
+                        codes = set()
+                        for v in data:
+                            try:
+                                codes.add(int(v))
+                            except Exception:
+                                continue
+                        if len(codes) > 0:
+                            self.infoplus_cancel_codes = codes
+        except Exception:
+            # ignore — fallback to built-in defaults
+            pass
 
     def run(self):
         print(f"[InfoPlus] Connecting to {self.endpoint}...")
@@ -327,55 +394,100 @@ class InfoPlusSubscriber(threading.Thread):
 
     def parse_xml(self, xml_content):
         try:
-            # Strip namespaces to simplify parsing
-            xml_clean = re.sub(r'xmlns="[^"]+"', '', xml_content)
-            xml_clean = re.sub(r'xmlns:\w+="[^"]+"', '', xml_clean)
-            xml_clean = re.sub(r'\w+:', '', xml_clean)
-
-            root = ET.fromstring(xml_clean)
-            for dvs in root.findall('.//DynamischeVertrekStaat'):
+            root = ET.fromstring(xml_content)
+            for dvs in find_elements_by_names(root, ['DynamischeVertrekStaat']):
                 self.process_dvs(dvs)
-            for rit_info in root.findall('.//RitInfo'):
+            for rit_info in find_elements_by_names(root, ['RitInfo']):
                 self.process_rit_info(rit_info)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[InfoPlus Error] parse_xml failed: {exc}")
 
     def process_rit_info(self, rit_info):
-        train_num = rit_info.findtext('.//TreinNummer') or rit_info.findtext('.//RitId') or rit_info.findtext('.//RitNummer') or rit_info.findtext('.//JourneyRef')
-        station_code = rit_info.findtext('.//StationCode') or rit_info.findtext('.//Station') or rit_info.findtext('.//StopCode') or rit_info.findtext('.//HalteCode')
+        train_num = find_text_any(rit_info, ['TreinNummer', 'RitId', 'RitNummer', 'LogischeRitNummer', 'JourneyRef'])
+        station_code = find_text_any(rit_info, ['StationCode', 'Station', 'StopCode', 'HalteCode'])
         if not train_num or not station_code:
             return
 
-        station_code = station_code.strip().lower()
+        station_code = station_code.strip()
+        m = re.match(r'^(?:nl:q:)(\d+)$', station_code, re.IGNORECASE)
+        if m:
+            station_code = f"NL:Q:{m.group(1)}"
+        else:
+            station_code = station_code.lower()
         train_num = train_num.strip()
         if train_num.isdigit():
             train_num = str(int(train_num))
 
-        status_text = (rit_info.findtext('.//RitWijzigingType') or rit_info.findtext('.//TreinStatus') or rit_info.findtext('.//WijzigingType') or rit_info.findtext('.//Status') or '').strip().upper()
-        detail_text = (rit_info.findtext('.//RitWijzigingTekst') or rit_info.findtext('.//Tekst') or rit_info.findtext('.//Text') or '').strip().upper()
+        status_text = find_text_any(rit_info, ['RitWijzigingType', 'TreinStatus', 'WijzigingType', 'Status', 'RitStatus', 'RitStopStatus', 'TripStopStatus', 'PasstimeEffect', 'InfoStatus']).upper()
+        detail_text = find_text_any(rit_info, ['RitWijzigingTekst', 'Tekst', 'Text', 'Bericht', 'BerichtTekst', 'Uiting']).upper()
 
         is_cancelled = False
-        if status_text.isdigit() and int(status_text) == 32:
-            is_cancelled = True
-        if any(token in status_text for token in ('CANCEL', 'VERVALLEN', 'RIJDETNIET', 'NOTDRIVING', 'DELETED', 'RIJDT NIET')):
-            is_cancelled = True
-        if any(token in detail_text for token in ('RIJDT NIET', 'RIJDETNIET', 'VERVALLEN', 'CANCEL', 'CANCELLED', 'NOTDRIVING', 'DELETED')):
+        # Numeric status codes from InfoPlus: treat known codes as cancellation
+        try:
+            if status_text.isdigit():
+                code = int(status_text)
+                if code in self.infoplus_cancel_codes:
+                    is_cancelled = True
+        except Exception:
+            pass
+
+        cancel_tokens = ('CANCEL', 'VERVALLEN', 'RIJDETNIET', 'RIJDT NIET', 'NOTDRIVING', 'DELETED')
+        if any(token in status_text for token in cancel_tokens) or any(token in detail_text for token in cancel_tokens):
             is_cancelled = True
 
+        if not is_cancelled:
+            raw_text = ''.join((child.text or '') + ''.join(child.attrib.values()) for child in rit_info.iter())
+            upper_text = raw_text.upper()
+            if any(token in upper_text for token in cancel_tokens):
+                is_cancelled = True
+            if not is_cancelled:
+                for child in rit_info.iter():
+                    for attr_value in child.attrib.values():
+                        if attr_value.isdigit() and int(attr_value) in self.infoplus_cancel_codes:
+                            is_cancelled = True
+                            break
+                    if is_cancelled:
+                        break
+
         delay_seconds = 0
-        delay_elem = rit_info.findtext('.//VertrekVertraging') or rit_info.findtext('.//Vertraging')
+        delay_elem = find_text_any(rit_info, ['ExacteVertrekVertraging', 'PresentatieVertrekVertraging', 'GedempteVertrekVertraging', 'ExacteAankomstVertraging', 'PresentatieAankomstVertraging', 'GedempteAankomstVertraging', 'VertrekVertraging', 'AankomstVertraging', 'Vertraging'])
         if delay_elem:
             delay_seconds = parse_iso_duration(delay_elem)
 
-        self.db.upsert_delay(train_num, station_code, delay_seconds, is_cancelled)
+        # Try to extract an expected time if present in the rit_info element
+        expected_time = None
+        try:
+            raw_xml = ET.tostring(rit_info, encoding='utf-8', method='xml').decode('utf-8')
+            m = re.search(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', raw_xml)
+            if m:
+                # ISO timestamp
+                dt = datetime.fromisoformat(m.group(1))
+                expected_time = dt.strftime('%Y-%m-%d %H:%M:%S')
+            else:
+                # look for time-only like HH:MM or HH:MM:SS
+                m2 = re.search(r'(\d{2}:\d{2}(?::\d{2})?)', raw_xml)
+                if m2:
+                    today = datetime.now()
+                    t = datetime.strptime(m2.group(1), '%H:%M:%S') if ':' in m2.group(1) and m2.group(1).count(':')==2 else datetime.strptime(m2.group(1), '%H:%M')
+                    dt = today.replace(hour=t.hour, minute=t.minute, second=getattr(t,'second',0), microsecond=0)
+                    expected_time = dt.strftime('%Y-%m-%d %H:%M:%S')
+        except Exception:
+            expected_time = None
+
+        self.db.upsert_delay(train_num, station_code, delay_seconds, is_cancelled, expected_time)
 
     def process_dvs(self, dvs):
-        train_num = dvs.findtext('.//TreinNummer') or dvs.findtext('.//RitId')
-        station_code = dvs.findtext('.//StationCode')
+        train_num = find_text_any(dvs, ['TreinNummer', 'RitId', 'RitNummer', 'LogischeRitNummer'])
+        station_code = find_text_any(dvs, ['StationCode'])
         if not train_num or not station_code:
             return
 
-        station_code = station_code.strip().lower()
+        station_code = station_code.strip()
+        m = re.match(r'^(?:nl:q:)(\d+)$', station_code, re.IGNORECASE)
+        if m:
+            station_code = f"NL:Q:{m.group(1)}"
+        else:
+            station_code = station_code.lower()
         train_num = train_num.strip()
         # Normalize to the canonical form without leading zeros. NS/InfoPlus
         # normally sends unpadded numbers already ("3617"), but this keeps
@@ -386,23 +498,64 @@ class InfoPlusSubscriber(threading.Thread):
         if train_num.isdigit():
             train_num = str(int(train_num))
 
-        status_text = (dvs.findtext('.//TreinStatus') or dvs.findtext('.//WijzigingType') or '').strip().upper()
-        detail_text = (dvs.findtext('.//Tekst') or dvs.findtext('.//Text') or '').strip().upper()
+        status_text = find_text_any(dvs, ['TreinStatus', 'WijzigingType', 'RitStatus', 'RitStopStatus', 'InfoStatus']).upper()
+        detail_text = find_text_any(dvs, ['Tekst', 'Text', 'Bericht', 'BerichtTekst', 'Uiting']).upper()
 
         is_cancelled = False
-        if status_text.isdigit() and int(status_text) == 32:
-            is_cancelled = True
-        if any(token in status_text for token in ('CANCEL', 'VERVALLEN', 'RIJDETNIET', 'NOTDRIVING', 'DELETED')):
-            is_cancelled = True
-        if any(token in detail_text for token in ('RIJDT NIET', 'RIJDETNIET', 'VERVALLEN', 'CANCEL', 'CANCELLED', 'NOTDRIVING', 'DELETED')):
+        # Numeric status codes from InfoPlus: treat known codes as cancellation
+        try:
+            if status_text.isdigit():
+                code = int(status_text)
+                if code in self.infoplus_cancel_codes:
+                    is_cancelled = True
+        except Exception:
+            pass
+
+        cancel_tokens = ('CANCEL', 'VERVALLEN', 'RIJDETNIET', 'RIJDT NIET', 'NOTDRIVING', 'DELETED')
+        if any(token in status_text for token in cancel_tokens) or any(token in detail_text for token in cancel_tokens):
             is_cancelled = True
 
+        if not is_cancelled:
+            raw_text = ''.join((child.text or '') + ''.join(child.attrib.values()) for child in dvs.iter())
+            upper_text = raw_text.upper()
+            if any(token in upper_text for token in cancel_tokens):
+                is_cancelled = True
+            if not is_cancelled:
+                for child in dvs.iter():
+                    for attr_value in child.attrib.values():
+                        if attr_value.isdigit() and int(attr_value) in self.infoplus_cancel_codes:
+                            is_cancelled = True
+                            break
+                    if is_cancelled:
+                        break
+
         delay_seconds = 0
-        delay_elem = dvs.findtext('.//VertrekVertraging') or dvs.findtext('.//Vertraging')
+        delay_elem = find_text_any(dvs, ['ExacteVertrekVertraging', 'PresentatieVertrekVertraging', 'GedempteVertrekVertraging', 'ExacteAankomstVertraging', 'PresentatieAankomstVertraging', 'GedempteAankomstVertraging', 'VertrekVertraging', 'AankomstVertraging', 'Vertraging'])
         if delay_elem:
             delay_seconds = parse_iso_duration(delay_elem)
 
-        self.db.upsert_delay(train_num, station_code, delay_seconds, is_cancelled)
+        # Try to extract an expected time if present in the dvs element
+        expected_time = None
+        try:
+            raw_xml = ET.tostring(dvs, encoding='utf-8', method='xml').decode('utf-8')
+            m = re.search(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', raw_xml)
+            if m:
+                dt = datetime.fromisoformat(m.group(1))
+                expected_time = dt.strftime('%Y-%m-%d %H:%M:%S')
+            else:
+                m2 = re.search(r'(\d{2}:\d{2}(?::\d{2})?)', raw_xml)
+                if m2:
+                    today = datetime.now()
+                    try:
+                        t = datetime.strptime(m2.group(1), '%H:%M:%S')
+                    except Exception:
+                        t = datetime.strptime(m2.group(1), '%H:%M')
+                    dt = today.replace(hour=t.hour, minute=t.minute, second=getattr(t,'second',0), microsecond=0)
+                    expected_time = dt.strftime('%Y-%m-%d %H:%M:%S')
+        except Exception:
+            expected_time = None
+
+        self.db.upsert_delay(train_num, station_code, delay_seconds, is_cancelled, expected_time)
 
 
 def main():

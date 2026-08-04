@@ -358,16 +358,33 @@ function createPopupContent(stop) {
     function formatDepartureTime(dep) {
         var time = escapeHtml(dep.time || '');
         if (dep.is_cancelled) {
-            return '<span style="color:#d00;text-decoration:line-through;">' + time + '</span> <span style="color:#d00;font-weight:700;">(vervallen)</span>';
+            return '<span style="color:#d00;font-weight:700;">Rijdt niet</span>';
         }
-        var delay = Number(dep.delay_seconds || 0);
-        if (delay === 0) {
-            return time;
+    if (dep.expected_time) {
+        // prefer explicit expected_time if provided (format HH:MM)
+        var m = ('' + dep.expected_time).match(/(\d{2}:\d{2})(?::\d{2})?$/);
+        if (m) {
+            return m[1];
         }
-        var minutes = Math.ceil(Math.abs(delay) / 60);
-        var sign = delay > 0 ? '+' : '-';
-        var color = delay > 0 ? '#d00' : '#0a0';
-        return time + ' <span style="color:' + color + ';">' + sign + minutes + '</span>';
+        try {
+            var dt = new Date(dep.expected_time);
+            if (!isNaN(dt.getTime())) {
+                var hh = dt.getHours();
+                var mm = dt.getMinutes();
+                return (hh < 10 ? '0' + hh : hh) + ':' + (mm < 10 ? '0' + mm : mm);
+            }
+        } catch (e) {
+            // fallthrough
+        }
+    }
+    var delay = Number(dep.delay_seconds || 0);
+    if (delay === 0) {
+        return time;
+    }
+    var minutes = Math.ceil(Math.abs(delay) / 60);
+    var sign = delay > 0 ? '+' : '-';
+    var color = delay > 0 ? '#d00' : '#0a0';
+    return time + ' <span style="color:' + color + ';">' + sign + minutes + '</span>';
     }
 
     if (stop.departures && stop.departures.length > 0) {

@@ -914,8 +914,7 @@ class Ovalino_Map {
 			       so.departure_seconds as dep_sec,
 			       so.arrival_seconds as arr_sec,
 			       d.train_type, d.line_code, d.destination_name as destination, j.journey_ref, j.train_number, j.direction_ref, j.footnote_ref,
-			       rd.delay_seconds, rd.is_cancelled,
-			       jm.max_stop_order
+			       rd.delay_seconds, rd.is_cancelled, rd.expected_time,			       jm.max_stop_order
 			FROM " . self::table('ovtd', 'journey_stops') . " so
 			INNER JOIN " . self::table('ovtd', 'journeys') . " j ON j.journey_ref = so.journey_ref
 			INNER JOIN " . self::table('ovtd', 'directions') . " d ON d.direction_ref = j.direction_ref
@@ -958,7 +957,7 @@ class Ovalino_Map {
 			$one_hour_ago = date('Y-m-d H:i:s', time() - 3600);
 			$params_delay = array_merge($lookup_journey_refs, $normalized_station_codes, array($one_hour_ago));
 			$delay_rows = $wpdb->get_results($wpdb->prepare(
-				"SELECT journey_ref, stop_code, delay_seconds, is_cancelled FROM $realtime_table WHERE journey_ref IN ($j_placeholders) AND stop_code IN ($station_placeholders) AND updated_at >= %s",
+				"SELECT journey_ref, stop_code, delay_seconds, is_cancelled, expected_time FROM $realtime_table WHERE journey_ref IN ($j_placeholders) AND stop_code IN ($station_placeholders) AND updated_at >= %s",
 				...$params_delay
 			), ARRAY_A);
 			if (!empty($delay_rows)) {
@@ -1030,11 +1029,12 @@ class Ovalino_Map {
 			if ($key_for_delay !== '' && isset($delay_map[$key_for_delay])) {
 				$delay_seconds = isset($delay_map[$key_for_delay]['delay_seconds']) ? (int) $delay_map[$key_for_delay]['delay_seconds'] : 0;
 				$is_cancelled = !empty($delay_map[$key_for_delay]['is_cancelled']);
+				$expected_time = isset($delay_map[$key_for_delay]['expected_time']) ? $delay_map[$key_for_delay]['expected_time'] : null;
 			} else {
 				$delay_seconds = isset($row['delay_seconds']) ? (int) $row['delay_seconds'] : 0;
 				$is_cancelled = !empty($row['is_cancelled']);
-			}
-			$visibility_ts = self::calculate_visibility_cutoff($ts, $delay_seconds);
+				$expected_time = isset($row['expected_time']) ? $row['expected_time'] : null;
+			}			$visibility_ts = self::calculate_visibility_cutoff($ts, $delay_seconds);
 
 			if ($visibility_ts >= $now && $ts <= $two_hours_later) {
 				$timezone = wp_timezone();
@@ -1051,6 +1051,7 @@ class Ovalino_Map {
 					'time' => $dt->format('H:i'),
 					'delay_seconds' => isset($delay_seconds) ? (int) $delay_seconds : 0,
 					'is_cancelled' => !empty($is_cancelled),
+					'expected_time' => isset($expected_time) ? $expected_time : null,
 					'lineRef' => $direction_ref,
 					'direction' => $direction_ref,
 					'timestamp' => $ts

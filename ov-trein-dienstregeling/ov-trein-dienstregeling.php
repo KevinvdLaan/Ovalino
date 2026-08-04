@@ -2059,27 +2059,47 @@ class OV_Trein_Dienstregeling {
 		$delays = array();
 		$realtime_table = $wpdb->prefix . 'ovhi_realtime_delays';
 
+		// Build stop-code variants to match how the realtime daemon stores values
+		$lookup_stop_codes = array();
+		$sc = trim((string) $station_code);
+		if ($sc !== '') {
+			$lookup_stop_codes[] = strtolower($sc);
+			// If form NL:Q:123, also add numeric variant
+			if (preg_match('/^nl:q:(\d+)$/i', $sc, $m)) {
+				$lookup_stop_codes[] = $m[1];
+			} elseif (preg_match('/^(\d+)$/', $sc, $m)) {
+				// If numeric, also add NL:Q: prefix
+				$lookup_stop_codes[] = 'NL:Q:' . $m[1];
+			}
+		}
+
+		$lookup_stop_codes = array_values(array_unique($lookup_stop_codes));
+
 		// Check if table exists before querying
-		if (!empty($lookup_journey_refs) && (bool) $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $realtime_table))) {
+		if (!empty($lookup_journey_refs) && !empty($lookup_stop_codes) && (bool) $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $realtime_table))) {
 			$j_placeholders = implode(',', array_fill(0, count($lookup_journey_refs), '%s'));
+			$s_placeholders = implode(',', array_fill(0, count($lookup_stop_codes), '%s'));
 			$one_hour_ago = date('Y-m-d H:i:s', time() - 3600);
-			$params_query = array_merge($lookup_journey_refs, array(strtolower($station_code), $one_hour_ago));
-			$delay_rows = $wpdb->get_results(
-				$wpdb->prepare(
-					"SELECT journey_ref, stop_code, delay_seconds, is_cancelled FROM $realtime_table WHERE journey_ref IN ($j_placeholders) AND stop_code = %s AND updated_at >= %s",
-					$params_query
-				),
-				ARRAY_A
-			);
+			$params = array_merge($lookup_journey_refs, $lookup_stop_codes, array($one_hour_ago));
+			$query = "SELECT journey_ref, stop_code, delay_seconds, is_cancelled FROM $realtime_table WHERE journey_ref IN ($j_placeholders) AND stop_code IN ($s_placeholders) AND updated_at >= %s";
+			$delay_rows = $wpdb->get_results($wpdb->prepare($query, ...$params), ARRAY_A);
 			if (!empty($delay_rows)) {
 				foreach ($delay_rows as $d_row) {
 					$matched_refs = isset($scheduled_refs_by_lookup[$d_row['journey_ref']]) ? $scheduled_refs_by_lookup[$d_row['journey_ref']] : array($d_row['journey_ref']);
 					foreach ($matched_refs as $matched_ref) {
-						$delays[(string) $matched_ref] = $d_row;
+						$key = $matched_ref . '|' . strtolower($d_row['stop_code']);
+						$delays[$key] = $d_row;
+						// Also add numeric / NL:Q variants for convenience
+						if (preg_match('/^NL:Q:(\d+)$/i', $d_row['stop_code'], $m)) {
+							$delays[$matched_ref . '|' . $m[1]] = $d_row;
+						} elseif (preg_match('/^(\d+)$/', $d_row['stop_code'], $m)) {
+							$delays[$matched_ref . '|NL:Q:' . $m[1]] = $d_row;
+						}
 					}
 				}
 			}
 		}
+		
 
 		// NS API fallback: vult alleen de ontbrekende combinaties aan (zie
 		// dezelfde toelichting in get_realtime_delays_for_journeys()).
@@ -2124,7 +2144,7 @@ class OV_Trein_Dienstregeling {
 
 			$time_str = $cand['scheduled_time']->format('H:i');
 			if ($cand['is_cancelled']) {
-				$time_str = '<s>' . $time_str . '</s> <span class="ov-cancelled" style="color: #d93025; font-weight: bold;">Vervallen</span>';
+				$time_str = '<span class="ov-cancelled" style="color: #d93025; font-weight: bold;">Rijdt niet</span>';
 			} elseif ($cand['delay_seconds'] > 0) {
 				$delay_minutes = round($cand['delay_seconds'] / 60);
 				if ($delay_minutes > 0) {
@@ -3075,7 +3095,7 @@ class OV_Trein_Dienstregeling {
 			$s_placeholders = implode(',', array_fill(0, count($st_codes), '%s'));
 			$one_hour_ago = date('Y-m-d H:i:s', time() - 3600);
 			$params = array_merge($lookup_journey_refs, $st_codes, array($one_hour_ago));
-			$query = "SELECT journey_ref, stop_code, delay_seconds, is_cancelled FROM $realtime_table WHERE journey_ref IN ($j_placeholders) AND stop_code IN ($s_placeholders) AND updated_at >= %s";
+			$query = "SELECT journey_ref, stop_code, delay_seconds, is_cancelled, expected_time FROM $realtime_table WHERE journey_ref IN ($j_placeholders) AND stop_code IN ($s_placeholders) AND updated_at >= %s";
 			$rows = $wpdb->get_results($wpdb->prepare($query, ...$params), ARRAY_A);
 			if (!empty($rows)) {
 				foreach ($rows as $r) {
@@ -3124,7 +3144,14 @@ class OV_Trein_Dienstregeling {
 			return $time_str;
 		}
 		if (!empty($delay_info['is_cancelled'])) {
-			return '<s>' . $time_str . '</s> <span class="ov-cancelled" style="color: #d93025; font-size: 11px; font-weight: bold;">Vervallen</span>';
+			return '<span class="ov-cancelled" style="color: #d93025; font-size: 11px; font-weight: bold;">Rijdt niet</span>';
+		}
+		// If an expected_time is provided by the realtime source, prefer showing that time
+		if (!empty($delay_info['expected_time'])) {
+			$ts = strtotime($delay_info['expected_time']);
+			if ($ts !== false) {
+				return date('H:i', $ts);
+			}
 		}
 		$delay_seconds = (int) $delay_info['delay_seconds'];
 		if ($delay_seconds > 0) {

@@ -2,7 +2,7 @@
 /**
  * Plugin Name: OV Halte Importer
  * Description: Upload CHB-, PassengerStopAssignment- en NeTEx-bestanden en toon automatisch lijnen en bestemmingen per halte via shortcode.
- * Version: 1.3.6
+ * Version: 1.3.7
  * Author: Kevin van der Laan
  * License: GPL-2.0-or-later
  */
@@ -12,7 +12,7 @@ if (!defined('ABSPATH')) {
 }
 
 class OV_Halte_Importer {
-	const VERSION = '1.3.6';
+	const VERSION = '1.3.7';
 	const OPTION_IMPORT_INFO = 'ovhi_import_info';
 	const OPTION_LIVE_DELAY_SETTINGS = 'ovhi_live_delay_settings';
 	const OPTION_LIVE_DELAY_LAST_SYNC = 'ovhi_live_delay_last_sync';
@@ -277,6 +277,7 @@ class OV_Halte_Importer {
 			stop_code varchar(100) NOT NULL default '',
 			delay_seconds int(11) NOT NULL default 0,
 			is_cancelled tinyint(1) NOT NULL default 0,
+			expected_time datetime NULL default NULL,
 			updated_at datetime NOT NULL default CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 			PRIMARY KEY  (journey_ref, stop_code),
 			KEY stop_code (stop_code)
@@ -356,6 +357,14 @@ class OV_Halte_Importer {
 		if (!in_array('journey_number', $journey_column_names, true)) {
 			$wpdb->query("ALTER TABLE $table_journeys ADD COLUMN journey_number varchar(20) NOT NULL default '' AFTER journey_ref");
 			$wpdb->query("ALTER TABLE $table_journeys ADD INDEX journey_number (journey_number)");
+		}
+
+		// Migrate realtime_delays table: add expected_time column if missing
+		$table_realtime = self::table('realtime_delays');
+		$realtime_columns = $wpdb->get_results("DESCRIBE $table_realtime");
+		$realtime_column_names = wp_list_pluck($realtime_columns, 'Field');
+		if (!in_array('expected_time', $realtime_column_names, true)) {
+			$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN expected_time datetime NULL default NULL AFTER is_cancelled");
 		}
 	}
 
@@ -571,6 +580,13 @@ class OV_Halte_Importer {
 					<tr>
 						<th scope="row"><label for="ovhi_live_poll_interval_seconds">Synchronisatie-interval</label></th>
 						<td><input type="number" id="ovhi_live_poll_interval_seconds" name="ovhi_live_poll_interval_seconds" min="10" max="3600" value="<?php echo esc_attr($live_settings['poll_interval_seconds']); ?>" /> seconden (maximaal 1 HTTP-oproep per interval)</td>
+					</tr>
+					<tr>
+						<th scope="row"><label for="ovhi_infoplus_cancel_codes">InfoPlus annuleringscodes</label></th>
+						<td>
+							<input type="text" id="ovhi_infoplus_cancel_codes" name="ovhi_infoplus_cancel_codes" class="regular-text" value="<?php echo esc_attr(implode(', ', (array) $live_settings['infoplus_cancel_codes'])); ?>" />
+							<p class="description">Komma-gescheiden lijst met numerieke InfoPlus-statuscodes die als annulering moeten worden geïnterpreteerd (bv. 25,32,39,44). Deze instellingen worden ook naar de daemon geschreven.</p>
+						</td>
 					</tr>
 					<tr>
 						<th scope="row">Laatste synchronisatie</th>
@@ -802,11 +818,91 @@ class OV_Halte_Importer {
 		throw new RuntimeException('Ongeldig JSON-formaat voor realtimevertragingen.');
 		}
 
-		if (isset($data['entries']) && is_array($data['entries'])) {
-		$data = $data['entries'];
+		return self::parse_realtime_delay_entries(self::extract_realtime_items($data));
+	}
+
+	private static function extract_realtime_items(array $data) {
+		if (empty($data)) {
+		return array();
 		}
 
-		return self::parse_realtime_delay_entries($data);
+		// Handle common envelope keys used by various APIs.
+		$container_keys = array('data', 'results', 'entries', 'delays', 'items', 'records');
+		foreach ($container_keys as $key) {
+		if (isset($data[$key]) && is_array($data[$key])) {
+			return self::extract_realtime_items($data[$key]);
+		}
+		}
+
+		// If the current layer already contains an indexed collection of rows,
+		// return it directly.
+		if (array_values($data) === $data) {
+			foreach ($data as $item) {
+				if (is_array($item)) {
+					return $data;
+				}
+			}
+		}
+
+		// If the current layer looks like a single realtime record object, return
+		// it as a single-item array so it can still be parsed.
+		$journey_fields = array('journey_ref', 'journeyRef', 'journey', 'journey_id', 'journeyId', 'trip_id', 'tripId', 'trip', 'tripRef', 'tripref', 'train_id', 'trainId', 'trainid', 'ritid');
+		$stop_code_fields = array('stop_code', 'stopCode', 'stop', 'stop_id', 'stopId', 'station_code', 'stationCode', 'halte_code', 'haltecode', 'quay_code', 'quayCode', 'user_stop_code', 'userStopCode', 'stop_point_ref', 'stopPointRef', 'stopPointCode', 'stop_point_code', 'stopplace_code');
+		if (self::get_realtime_field_value($data, $journey_fields) !== null && self::get_realtime_field_value($data, $stop_code_fields) !== null) {
+			return array($data);
+		}
+
+		// Otherwise search deeper for the first array of records.
+		foreach ($data as $value) {
+		if (is_array($value)) {
+			$items = self::extract_realtime_items($value);
+			if (!empty($items)) {
+				return $items;
+			}
+		}
+		}
+
+		return array();
+	}
+
+	private static function get_realtime_field_value($item, array $field_names) {
+		$result = self::get_realtime_field_and_key($item, $field_names);
+		return $result['value'];
+	}
+
+	private static function get_realtime_field_and_key($item, array $field_names) {
+		$result = array('key' => null, 'value' => null);
+		if (!is_array($item)) {
+		return $result;
+		}
+
+		foreach ($field_names as $field_name) {
+			if (array_key_exists($field_name, $item) && $item[$field_name] !== null && $item[$field_name] !== '') {
+				return array('key' => $field_name, 'value' => $item[$field_name]);
+			}
+		}
+
+		foreach ($item as $key => $value) {
+			if (!is_string($key)) {
+				continue;
+			}
+			foreach ($field_names as $field_name) {
+				if (strcasecmp($key, $field_name) === 0 && $value !== null && $value !== '') {
+					return array('key' => $key, 'value' => $value);
+				}
+			}
+		}
+
+		foreach ($item as $value) {
+			if (is_array($value)) {
+				$nested = self::get_realtime_field_and_key($value, $field_names);
+				if ($nested['value'] !== null) {
+					return $nested;
+				}
+			}
+		}
+
+		return $result;
 	}
 
 	private static function parse_realtime_delay_csv_file($path) {
@@ -835,81 +931,161 @@ class OV_Halte_Importer {
 	private static function parse_realtime_delay_entries(array $items) {
 		$entries = array();
 		foreach ($items as $item) {
-		if (!is_array($item)) {
-			continue;
-		}
-
-		$journey_ref = '';
-		$stop_code = '';
-		$delay_seconds = 0;
-		$is_cancelled = false;
-
-		$field_candidates = array(
-			'journey_ref' => array('journey_ref', 'journeyRef', 'journey'),
-			'stop_code' => array('stop_code', 'stopCode', 'stop', 'stop_code', 'stopCode'),
-			'delay_seconds' => array('delay_seconds', 'delaySeconds', 'delay', 'delay_minutes', 'delayMinutes'),
-			'is_cancelled' => array('is_cancelled', 'isCancelled', 'cancelled', 'canceled', 'isCanceled'),
-		);
-
-		foreach ($field_candidates['journey_ref'] as $field) {
-			if (isset($item[$field]) && trim((string) $item[$field]) !== '') {
-				$journey_ref = trim((string) $item[$field]);
-				break;
+			if (!is_array($item)) {
+				continue;
 			}
-		}
 
-		foreach ($field_candidates['stop_code'] as $field) {
-			if (isset($item[$field]) && trim((string) $item[$field]) !== '') {
-				$stop_code = trim((string) $item[$field]);
-				break;
+			$journey_ref = '';
+			$stop_code = '';
+			$delay_seconds = 0;
+			$is_cancelled = false;
+
+			$field_candidates = array(
+				'journey_ref' => array('journey_ref', 'journeyRef', 'journey', 'journey_id', 'journeyId', 'trip_id', 'tripId', 'trip', 'tripRef', 'tripref', 'train_id', 'trainId', 'trainid', 'ritid', 'journeyNumber', 'journey_number', 'vehicleJourneyRef', 'serviceJourneyRef'),
+				'stop_code' => array('stop_code', 'stopCode', 'stop', 'stop_id', 'stopId', 'station_code', 'stationCode', 'halte_code', 'haltecode', 'quay_code', 'quayCode', 'user_stop_code', 'userStopCode', 'stop_point_ref', 'stopPointRef', 'stopPointCode', 'stop_point_code', 'stopplace_code', 'userStopCode', 'station', 'stationCode'),
+				'delay_seconds' => array('delay_seconds', 'delaySeconds', 'delay', 'delay_minutes', 'delayMinutes', 'delayInSeconds', 'delay_in_seconds', 'lateness', 'lateness_seconds', 'vertrekvertraging', 'vertrekVertraging', 'vertraging'),
+				'is_cancelled' => array('is_cancelled', 'isCancelled', 'cancelled', 'canceled', 'isCanceled', 'status', 'train_status', 'trip_status', 'tripStatus', 'reis_status', 'cancelReason', 'cancel_reason', 'cancellation', 'cancellationStatus', 'cancellation_reason'),
+			);
+
+			$journey_ref_value = self::get_realtime_field_value($item, $field_candidates['journey_ref']);
+			if ($journey_ref_value !== null && trim((string) $journey_ref_value) !== '') {
+				$journey_ref = trim((string) $journey_ref_value);
 			}
-		}
 
-		foreach ($field_candidates['delay_seconds'] as $field) {
-			if (isset($item[$field]) && trim((string) $item[$field]) !== '') {
-				$delay_seconds = self::normalize_delay_value($item[$field]);
-				if (stripos($field, 'minute') !== false) {
+			$stop_code_value = self::get_realtime_field_value($item, $field_candidates['stop_code']);
+			if ($stop_code_value !== null && trim((string) $stop_code_value) !== '') {
+				$stop_code = trim((string) $stop_code_value);
+			}
+
+			$delay_field = self::get_realtime_field_and_key($item, $field_candidates['delay_seconds']);
+			if ($delay_field['value'] !== null && trim((string) $delay_field['value']) !== '') {
+				$delay_seconds = self::normalize_delay_value($delay_field['value']);
+				if ($delay_field['key'] !== null && stripos($delay_field['key'], 'minute') !== false) {
 					$delay_seconds = $delay_seconds * 60;
 				}
-				break;
 			}
-		}
 
-		foreach ($field_candidates['is_cancelled'] as $field) {
-			if (isset($item[$field])) {
-				$is_cancelled = self::normalize_boolean_value($item[$field]);
-				break;
-			}
-		}
-
-		if ($journey_ref !== '' && $stop_code !== '') {
-			$alt_journey_refs = array($journey_ref);
-			if (strpos($journey_ref, ':') !== false) {
-				$parts = explode(':', $journey_ref);
-				$last_part = end($parts);
-				if ($last_part !== '' && $last_part !== $journey_ref) {
-					$alt_journey_refs[] = $last_part;
+			$expected_time = '';
+			$expected_time_fields = array(
+				'expected_time',
+				'expectedTime',
+				'expectedDepartureTime',
+				'expectedArrivalTime',
+				'expected_departure_time',
+				'expected_arrival_time',
+				'expectedDepartureTimestamp',
+				'expectedArrivalTimestamp',
+				'plannedDepartureTime',
+				'plannedArrivalTime',
+				'planned_departure_time',
+				'planned_arrival_time',
+				'scheduledDepartureTime',
+				'scheduledArrivalTime',
+				'scheduled_departure_time',
+				'scheduled_arrival_time',
+				'actualDepartureTime',
+				'actualArrivalTime',
+				'realTimeDeparture',
+				'realTimeArrival',
+				'real_time',
+				'targetDepartureTime',
+				'targetArrivalTime',
+				'target_departure_time',
+				'target_arrival_time',
+				'estimatedTime',
+				'estimated_time',
+				'expected',
+				'time',
+				'tijd',
+			);
+			$expected_value = self::get_realtime_field_value($item, $expected_time_fields);
+			if ($expected_value !== null && trim((string) $expected_value) !== '') {
+				$raw = trim((string) $expected_value);
+				if (preg_match('/^\d{10}(?:\d{3})?$/', $raw)) {
+					$timestamp = (int) $raw;
+					if (strlen($raw) === 13) {
+						$timestamp = (int) round($timestamp / 1000);
+					}
+					if ($timestamp > 0) {
+						$expected_time = date('Y-m-d H:i:s', $timestamp);
+					}
+				} else {
+					$ts = strtotime($raw);
+					if ($ts !== false && $ts > 0) {
+						$expected_time = date('Y-m-d H:i:s', $ts);
+					} elseif (preg_match('/^\d{2}:\d{2}(?::\d{2})?$/', $raw)) {
+						$today = date('Y-m-d');
+						$expected_time = $today . ' ' . $raw . (strlen($raw) === 5 ? ':00' : '');
+					}
 				}
 			}
 
-			$alt_stop_codes = array($stop_code);
-			if (preg_match('/^NL:Q:(\d+)$/', $stop_code, $m)) {
-				$alt_stop_codes[] = $m[1];
-			} elseif (preg_match('/^\d+$/', $stop_code)) {
-				$alt_stop_codes[] = 'NL:Q:' . $stop_code;
-			}
-
-			foreach ($alt_journey_refs as $j_ref) {
-				foreach ($alt_stop_codes as $s_code) {
-					$entries[] = array(
-						'journey_ref'   => $j_ref,
-						'stop_code'     => $s_code,
-						'delay_seconds' => $delay_seconds,
-						'is_cancelled'  => $is_cancelled ? 1 : 0,
-					);
+			$live_settings = self::get_live_delay_settings();
+			$info_cancel_codes = array();
+			if (isset($live_settings['infoplus_cancel_codes']) && is_array($live_settings['infoplus_cancel_codes'])) {
+				foreach ($live_settings['infoplus_cancel_codes'] as $c) {
+					if (is_numeric($c)) {
+						$info_cancel_codes[] = (int) $c;
+					}
 				}
 			}
-		}
+			if (empty($info_cancel_codes)) {
+				$info_cancel_codes = array(25, 32, 34, 39, 44);
+			}
+
+			$is_cancel_field = null;
+			foreach ($field_candidates['is_cancelled'] as $field) {
+				$cancel_value = self::get_realtime_field_value($item, array($field));
+				if ($cancel_value !== null) {
+					$raw_val = trim((string) $cancel_value);
+					if ($raw_val !== '' && is_numeric($raw_val)) {
+						$code = (int) $raw_val;
+						if (in_array($field, array('is_cancelled', 'isCancelled', 'cancelled', 'canceled', 'isCanceled'), true)) {
+							$is_cancelled = self::normalize_boolean_value($raw_val);
+						} elseif (in_array($code, $info_cancel_codes, true)) {
+							$is_cancelled = true;
+						}
+					} else {
+						$is_cancelled = self::normalize_boolean_value($raw_val);
+					}
+					break;
+				}
+			}
+
+			// If no explicit cancellation field matched, search any text field for cancel tokens.
+			if (!$is_cancelled && self::detect_cancel_in_text_recursive($item)) {
+				$is_cancelled = true;
+			}
+
+			if ($journey_ref !== '' && $stop_code !== '') {
+				$alt_journey_refs = array($journey_ref);
+				if (strpos($journey_ref, ':') !== false) {
+					$parts = explode(':', $journey_ref);
+					$last_part = end($parts);
+					if ($last_part !== '' && $last_part !== $journey_ref) {
+						$alt_journey_refs[] = $last_part;
+					}
+				}
+
+				$alt_stop_codes = array($stop_code);
+				if (preg_match('/^NL:Q:(\d+)$/i', $stop_code, $m)) {
+					$alt_stop_codes[] = $m[1];
+				} elseif (preg_match('/^\d+$/', $stop_code)) {
+					$alt_stop_codes[] = 'NL:Q:' . $stop_code;
+				}
+
+				foreach ($alt_journey_refs as $j_ref) {
+					foreach ($alt_stop_codes as $s_code) {
+						$entries[] = array(
+							'journey_ref'   => $j_ref,
+							'stop_code'     => $s_code,
+							'delay_seconds' => $delay_seconds,
+							'is_cancelled'  => $is_cancelled ? 1 : 0,
+							'expected_time' => $expected_time,
+						);
+					}
+				}
+			}
 		}
 
 		return $entries;
@@ -917,34 +1093,116 @@ class OV_Halte_Importer {
 
 	private static function normalize_delay_value($value) {
 		if (is_numeric($value)) {
-		return (int) round((float) $value);
+			return (int) round((float) $value);
 		}
 
 		if (is_string($value)) {
-		$clean = trim(str_replace(array('+', 'min', 'minutes', 'mins'), '', strtolower($value)));
-		if ($clean === '') {
-			return 0;
-		}
-		return (int) round((float) $clean);
+			$clean = trim(strtolower($value));
+			if ($clean === '') {
+				return 0;
+			}
+
+			if (preg_match('/^\d{1,2}:\d{2}(?::\d{2})?$/', $clean)) {
+				return self::time_to_seconds($clean);
+			}
+
+			if (preg_match('/^pt(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/', $clean, $matches)) {
+				$hours = isset($matches[1]) && $matches[1] !== '' ? (int) $matches[1] : 0;
+				$minutes = isset($matches[2]) && $matches[2] !== '' ? (int) $matches[2] : 0;
+				$seconds = isset($matches[3]) && $matches[3] !== '' ? (int) $matches[3] : 0;
+				return $hours * HOUR_IN_SECONDS + $minutes * MINUTE_IN_SECONDS + $seconds;
+			}
+
+			$clean = trim(str_replace(array('+', 'min', 'minutes', 'mins'), '', $clean));
+			if ($clean === '') {
+				return 0;
+			}
+			return (int) round((float) $clean);
 		}
 
 		return 0;
 	}
 
 	private static function normalize_boolean_value($value) {
-		if (is_bool($value)) {
+	if (is_bool($value)) {
 		return $value;
-		}
+	}
 
-		if (is_numeric($value)) {
+	if (is_numeric($value)) {
 		return ((int) $value) !== 0;
-		}
+	}
 
-		if (is_string($value)) {
+	if (is_string($value)) {
 		$value = strtolower(trim($value));
-		return in_array($value, array('1', 'true', 'yes', 'y', 'ja', 'oui', 'cancelled', 'canceled', 'vervallen', 'true'), true);
+		if ($value === '') {
+			return false;
 		}
 
+		$truthy_values = array('1', 'true', 'yes', 'y', 'ja', 'oui');
+		if (in_array($value, $truthy_values, true)) {
+			return true;
+		}
+
+		$cancel_tokens = array(
+			'cancelled',
+			'canceled',
+			'vervallen',
+			'geannuleerd',
+			'annulering',
+			'rijdt niet',
+			'rijdtniet',
+			'rijdetniet',
+			'niet gereden',
+			'nietgereden',
+			'nietopgevoerd',
+			'notdriving',
+			'deleted',
+			'cancel',
+		);
+		foreach ($cancel_tokens as $token) {
+			if (strpos($value, $token) !== false) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	return false;
+	}
+
+	/**
+	 * Detect cancellation tokens in free-form text without treating numeric
+	 * values like "5" as boolean true. Useful for scanning arbitrary feed
+	 * fields where numbers (delays) may otherwise be misinterpreted as
+	 * cancellation flags.
+	 */
+	private static function detect_cancel_in_text($text) {
+	if (!is_string($text) || trim($text) === '') {
+		return false;
+	}
+	$value = strtolower(trim($text));
+	$cancel_tokens = array('cancelled','canceled','vervallen','geannuleerd','annulering','rijdt niet','rijdtniet','rijdetniet','niet gereden','nietgereden','nietopgevoerd','notdriving','deleted','cancel');
+	foreach ($cancel_tokens as $token) {
+		if (strpos($value, $token) !== false) {
+			return true;
+		}
+	}
+	return false;
+	}
+
+	private static function detect_cancel_in_text_recursive($item) {
+		if (is_string($item)) {
+			return self::detect_cancel_in_text($item);
+		}
+		if (!is_array($item)) {
+			return false;
+		}
+		foreach ($item as $value) {
+			if (self::detect_cancel_in_text_recursive($value)) {
+				return true;
+			}
+		}
 		return false;
 	}
 
@@ -1007,14 +1265,16 @@ class OV_Halte_Importer {
 			$values = array();
 			$queries = array();
 			foreach ($chunk as $row) {
-				$queries[] = '(%s, %s, %d, %d, NOW())';
+				// expected_time may be an empty string; use NULLIF in the VALUES list
+				$queries[] = "(%s, %s, %d, %d, NULLIF(%s, ''), NOW())";
 				$values[] = isset($row['journey_ref']) ? $row['journey_ref'] : '';
 				$values[] = isset($row['stop_code']) ? $row['stop_code'] : '';
 				$values[] = isset($row['delay_seconds']) ? (int) $row['delay_seconds'] : 0;
 				$values[] = isset($row['is_cancelled']) ? (int) $row['is_cancelled'] : 0;
+				$values[] = isset($row['expected_time']) ? $row['expected_time'] : '';
 			}
 
-			$sql = 'INSERT INTO ' . $table . ' (journey_ref, stop_code, delay_seconds, is_cancelled, updated_at) VALUES ' . implode(', ', $queries) . ' ON DUPLICATE KEY UPDATE delay_seconds = VALUES(delay_seconds), is_cancelled = VALUES(is_cancelled), updated_at = NOW()';
+			$sql = 'INSERT INTO ' . $table . ' (journey_ref, stop_code, delay_seconds, is_cancelled, expected_time, updated_at) VALUES ' . implode(', ', $queries) . ' ON DUPLICATE KEY UPDATE delay_seconds = VALUES(delay_seconds), is_cancelled = VALUES(is_cancelled), expected_time = VALUES(expected_time), updated_at = NOW()';
 			$result = $wpdb->query($wpdb->prepare($sql, $values));
 
 			if ($result === false) {
@@ -1169,12 +1429,30 @@ class OV_Halte_Importer {
 		return trim((string) end($parts));
 	}
 
+	private static function get_realtime_journey_ref_variants($journey_ref) {
+		$journey_ref = trim((string) $journey_ref);
+		if ($journey_ref === '') {
+			return array();
+		}
+
+		$variants = array($journey_ref);
+		if (strpos($journey_ref, ':') !== false) {
+			$parts = explode(':', $journey_ref);
+			$short_ref = trim((string) end($parts));
+			if ($short_ref !== '' && $short_ref !== $journey_ref) {
+				$variants[] = $short_ref;
+			}
+		}
+
+		return array_values(array_unique($variants));
+	}
+
 	private static function get_realtime_stop_code_variants($stop_code) {
 		$stop_code = trim((string) $stop_code);
 		if ($stop_code === '') {
 			return array();
 		}
-		if (preg_match('/^NL:Q:(\d+)$/', $stop_code, $matches)) {
+		if (preg_match('/^NL:Q:(\d+)$/i', $stop_code, $matches)) {
 			return array($stop_code, $matches[1]);
 		}
 		if (preg_match('/^\d+$/', $stop_code)) {
@@ -1585,11 +1863,28 @@ class OV_Halte_Importer {
 			'auth_token' => '',
 			'timeout_seconds' => 3,
 			'poll_interval_seconds' => 60,
+			// Default InfoPlus cancellation codes (integer array)
+			'infoplus_cancel_codes' => array(25, 32, 34, 39, 44),
 		);
 
 		$settings = get_option(self::OPTION_LIVE_DELAY_SETTINGS, array());
 		if (!is_array($settings)) {
 			$settings = array();
+		}
+
+		// Ensure infoplus_cancel_codes becomes an array if stored as CSV or string
+		if (isset($settings['infoplus_cancel_codes']) && is_string($settings['infoplus_cancel_codes'])) {
+			$raw = trim($settings['infoplus_cancel_codes']);
+			if ($raw === '') {
+				$settings['infoplus_cancel_codes'] = array();
+			} else {
+				$parts = preg_split('/[,;\s]+/', $raw);
+				$nums = array();
+				foreach ($parts as $p) {
+					if (is_numeric($p)) $nums[] = (int) $p;
+				}
+				$settings['infoplus_cancel_codes'] = $nums;
+			}
 		}
 
 		return wp_parse_args($settings, $defaults);
@@ -1629,9 +1924,35 @@ class OV_Halte_Importer {
 			'auth_token' => isset($settings['auth_token']) ? trim($settings['auth_token']) : '',
 			'timeout_seconds' => max(1, (int) $settings['timeout_seconds']),
 			'poll_interval_seconds' => max(10, (int) $settings['poll_interval_seconds']),
+			// allow passing infoplus_cancel_codes either as array or CSV string
+			'infoplus_cancel_codes' => isset($settings['infoplus_cancel_codes']) ? $settings['infoplus_cancel_codes'] : array(),
 		);
 
+		// Normalize infoplus_cancel_codes to array of ints
+		$codes = array();
+		if (is_string($allowed['infoplus_cancel_codes'])) {
+			$parts = preg_split('/[,;\s]+/', $allowed['infoplus_cancel_codes']);
+			foreach ($parts as $p) {
+				if (is_numeric($p)) $codes[] = (int) $p;
+			}
+		} elseif (is_array($allowed['infoplus_cancel_codes'])) {
+			foreach ($allowed['infoplus_cancel_codes'] as $p) {
+				if (is_numeric($p)) $codes[] = (int) $p;
+			}
+		}
+		$allowed['infoplus_cancel_codes'] = array_values(array_unique($codes));
+
 		update_option(self::OPTION_LIVE_DELAY_SETTINGS, $allowed, false);
+
+		// Also write a JSON file next to the plugin so the daemon can read the same codes
+		try {
+			$plugin_dir = plugin_dir_path(__FILE__);
+			$file = $plugin_dir . 'infoplus_cancel_codes.json';
+			@file_put_contents($file, wp_json_encode($allowed['infoplus_cancel_codes']));
+		} catch (Throwable $e) {
+			// ignore file write errors but log for debugging
+			error_log('OVHI: kon infoplus-codes niet naar bestand schrijven: ' . $e->getMessage());
+		}
 
 		if (function_exists('wp_clear_scheduled_hook')) {
 			wp_clear_scheduled_hook('ovhi_cron_sync_realtime_delays');
@@ -1700,18 +2021,7 @@ class OV_Halte_Importer {
 			return 0;
 		}
 
-		// Zoek naar de array met items, ook als deze verpakt zit in data, results, entries, etc.
-		$items = $data;
-		if (isset($data['data']) && is_array($data['data'])) {
-			$items = $data['data'];
-		} elseif (isset($data['results']) && is_array($data['results'])) {
-			$items = $data['results'];
-		} elseif (isset($data['entries']) && is_array($data['entries'])) {
-			$items = $data['entries'];
-		} elseif (isset($data['delays']) && is_array($data['delays'])) {
-			$items = $data['delays'];
-		}
-
+		$items = self::extract_realtime_items($data);
 		if (empty($items) || !is_array($items)) {
 			self::set_live_delay_last_sync(time());
 			return 0;
@@ -1783,6 +2093,7 @@ class OV_Halte_Importer {
 			'auth_token' => isset($_POST['ovhi_live_auth_token']) ? sanitize_text_field(wp_unslash($_POST['ovhi_live_auth_token'])) : '',
 			'timeout_seconds' => isset($_POST['ovhi_live_timeout_seconds']) ? (int) $_POST['ovhi_live_timeout_seconds'] : 3,
 			'poll_interval_seconds' => isset($_POST['ovhi_live_poll_interval_seconds']) ? (int) $_POST['ovhi_live_poll_interval_seconds'] : 60,
+			'infoplus_cancel_codes' => isset($_POST['ovhi_infoplus_cancel_codes']) ? sanitize_text_field(wp_unslash($_POST['ovhi_infoplus_cancel_codes'])) : '',
 		);
 
 		self::save_live_delay_settings($settings);
@@ -1833,10 +2144,26 @@ class OV_Halte_Importer {
 			return array();
 		}
 
+		$lookup_journey_refs = array();
+		$lookup_to_scheduled = array();
+		foreach ($journey_refs as $journey_ref) {
+			foreach (self::get_realtime_journey_ref_variants($journey_ref) as $variant) {
+				$lookup_journey_refs[] = $variant;
+				if (!isset($lookup_to_scheduled[$variant])) {
+					$lookup_to_scheduled[$variant] = array();
+				}
+				$lookup_to_scheduled[$variant][] = $journey_ref;
+			}
+		}
+		$lookup_journey_refs = array_values(array_unique(array_filter($lookup_journey_refs)));
+		if (empty($lookup_journey_refs)) {
+			return array();
+		}
+
 		$lookup_stop_codes = array();
 		foreach ($stop_codes as $stop_code) {
 			$lookup_stop_codes[] = $stop_code;
-			if (preg_match('/^NL:Q:(\d+)$/', $stop_code, $matches)) {
+			if (preg_match('/^NL:Q:(\d+)$/i', $stop_code, $matches)) {
 				$lookup_stop_codes[] = $matches[1];
 			} elseif (preg_match('/^\d+$/', $stop_code)) {
 				$lookup_stop_codes[] = 'NL:Q:' . $stop_code;
@@ -1853,20 +2180,47 @@ class OV_Halte_Importer {
 		}
 
 		$table = self::table('realtime_delays');
-		$placeholders_j = implode(',', array_fill(0, count($journey_refs), '%s'));
+		$placeholders_j = implode(',', array_fill(0, count($lookup_journey_refs), '%s'));
 		$placeholders_s = implode(',', array_fill(0, count($lookup_stop_codes), '%s'));
-		$params = array_merge($journey_refs, $lookup_stop_codes);
+		$params = array_merge($lookup_journey_refs, $lookup_stop_codes);
 
-		$query = 'SELECT journey_ref, stop_code, delay_seconds, is_cancelled FROM ' . $table . ' WHERE journey_ref IN (' . $placeholders_j . ') AND stop_code IN (' . $placeholders_s . ')';
+		$query = 'SELECT journey_ref, stop_code, delay_seconds, is_cancelled, expected_time FROM ' . $table . ' WHERE journey_ref IN (' . $placeholders_j . ') AND stop_code IN (' . $placeholders_s . ')';
 		$rows = $wpdb->get_results($wpdb->prepare($query, $params), ARRAY_A);
 
 		$map = array();
 		foreach ((array) $rows as $row) {
-			$key = $row['journey_ref'] . '|' . $row['stop_code'];
-			$map[$key] = array(
+			$delay = array(
 				'delay_seconds' => isset($row['delay_seconds']) ? (int) $row['delay_seconds'] : 0,
 				'is_cancelled'  => !empty($row['is_cancelled']),
+				'expected_time' => isset($row['expected_time']) ? $row['expected_time'] : null,
 			);
+			$stored_key = $row['journey_ref'] . '|' . $row['stop_code'];
+			$map[$stored_key] = $delay;
+
+			$stop_code_variants = array($row['stop_code']);
+			if (preg_match('/^NL:Q:(\d+)$/i', $row['stop_code'], $matches)) {
+				$stop_code_variants[] = $matches[1];
+			} elseif (preg_match('/^(\d+)$/', $row['stop_code'], $matches)) {
+				$stop_code_variants[] = 'NL:Q:' . $matches[1];
+			}
+
+			foreach (array_values(array_unique($stop_code_variants)) as $stop_code_variant) {
+				$key = $row['journey_ref'] . '|' . $stop_code_variant;
+				if (!isset($map[$key])) {
+					$map[$key] = $delay;
+				}
+			}
+
+			if (isset($lookup_to_scheduled[$row['journey_ref']])) {
+				foreach (array_values(array_unique($lookup_to_scheduled[$row['journey_ref']])) as $scheduled_ref) {
+					foreach ($stop_code_variants as $stop_code_variant) {
+						$alternate_key = $scheduled_ref . '|' . $stop_code_variant;
+						if (!isset($map[$alternate_key])) {
+							$map[$alternate_key] = $delay;
+						}
+					}
+				}
+			}
 		}
 		return $map;
 	}
@@ -1897,13 +2251,20 @@ class OV_Halte_Importer {
 		}
 
 		$table = self::table('realtime_delays');
-		$query = 'SELECT delay_seconds, is_cancelled FROM ' . $table . ' WHERE journey_ref = %s AND stop_code = %s LIMIT 1';
-		$row = $wpdb->get_row($wpdb->prepare($query, $journey_ref, $stop_code), ARRAY_A);
-
-		if (empty($row) && preg_match('/^[0-9]+$/', $stop_code)) {
-			$alt_stop_code = 'NL:Q:' . $stop_code;
-			$row = $wpdb->get_row($wpdb->prepare($query, $journey_ref, $alt_stop_code), ARRAY_A);
+		$journey_ref_variants = self::get_realtime_journey_ref_variants($journey_ref);
+		$lookup_stop_codes = array($stop_code);
+		if (preg_match('/^NL:Q:(\d+)$/i', $stop_code, $matches)) {
+			$lookup_stop_codes[] = $matches[1];
+		} elseif (preg_match('/^(\d+)$/', $stop_code, $matches)) {
+			$lookup_stop_codes[] = 'NL:Q:' . $matches[1];
 		}
+		$lookup_stop_codes = array_values(array_unique($lookup_stop_codes));
+
+		$placeholders_j = implode(',', array_fill(0, count($journey_ref_variants), '%s'));
+		$placeholders_s = implode(',', array_fill(0, count($lookup_stop_codes), '%s'));
+		$query = 'SELECT journey_ref, delay_seconds, is_cancelled FROM ' . $table . ' WHERE journey_ref IN (' . $placeholders_j . ') AND stop_code IN (' . $placeholders_s . ') ORDER BY FIELD(journey_ref, ' . $placeholders_j . ') LIMIT 1';
+		$params = array_merge($journey_ref_variants, $lookup_stop_codes, $journey_ref_variants);
+		$row = $wpdb->get_row($wpdb->prepare($query, $params), ARRAY_A);
 
 		$res = array(
 			'delay_seconds' => (!empty($row) && isset($row['delay_seconds'])) ? (int) $row['delay_seconds'] : 0,
@@ -3673,6 +4034,7 @@ private static function parse_assignment(XMLReader $reader) {
 
 			$row['delay_seconds'] = (is_array($delay) && isset($delay['delay_seconds'])) ? (int) $delay['delay_seconds'] : 0;
 			$row['is_cancelled'] = (is_array($delay) && !empty($delay['is_cancelled']));
+			$row['expected_time'] = (is_array($delay) && isset($delay['expected_time'])) ? $delay['expected_time'] : null;
 			$total_seconds = (int) $row['departure_seconds'] + (int) $row['offset_seconds'];
 			$groups[$total_seconds][] = $row;
 		}
@@ -3708,7 +4070,7 @@ private static function parse_assignment(XMLReader $reader) {
 
 			if ($visibility_candidate > $window['now'] && $realtime_candidate >= $window['start'] && $realtime_candidate < $window['end']) {
 				$planned_time_str = $planned_candidate->format('H:i');
-				$formatted = self::format_time_with_delay($planned_time_str, $row['delay_seconds'], $row['is_cancelled']);
+				$formatted = self::format_time_with_delay($planned_time_str, $row['delay_seconds'], $row['is_cancelled'], isset($row['expected_time']) ? $row['expected_time'] : '');
 				$candidates[$realtime_candidate->getTimestamp()] = $formatted;
 			}
 		}
@@ -3721,10 +4083,17 @@ private static function parse_assignment(XMLReader $reader) {
 		return array_slice(array_values($candidates), 0, $limit);
 	}
 
-	private static function format_time_with_delay($time_str, $delay_seconds = 0, $is_cancelled = false) {
+	private static function format_time_with_delay($time_str, $delay_seconds = 0, $is_cancelled = false, $expected_time = '') {
 		$time_html = esc_html((string) $time_str);
 		if ($is_cancelled) {
-			return '<s>' . $time_html . '</s> <span style="color:#d00;font-weight:700;">(vervallen)</span>';
+			return '<span style="color:#d00;font-weight:700;">Rijdt niet</span>';
+		}
+		// prefer explicit expected_time from realtime if provided
+		if (!empty($expected_time)) {
+			$ts = strtotime($expected_time);
+			if ($ts !== false) {
+				return date('H:i', $ts);
+			}
 		}
 		if (empty($delay_seconds)) {
 			return $time_html;
