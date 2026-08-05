@@ -1124,52 +1124,56 @@ class OV_Halte_Importer {
 	}
 
 	private static function normalize_boolean_value($value) {
-	if (is_bool($value)) {
-		return $value;
-	}
-
-	if (is_numeric($value)) {
-		return ((int) $value) !== 0;
-	}
-
-	if (is_string($value)) {
-		$value = strtolower(trim($value));
-		if ($value === '') {
-			return false;
+		if (is_bool($value)) {
+			return $value;
 		}
 
-		$truthy_values = array('1', 'true', 'yes', 'y', 'ja', 'oui');
-		if (in_array($value, $truthy_values, true)) {
-			return true;
+		if (is_numeric($value)) {
+			return ((int) $value) !== 0;
 		}
 
-		$cancel_tokens = array(
-			'cancelled',
-			'canceled',
-			'vervallen',
-			'geannuleerd',
-			'annulering',
-			'rijdt niet',
-			'rijdtniet',
-			'rijdetniet',
-			'niet gereden',
-			'nietgereden',
-			'nietopgevoerd',
-			'notdriving',
-			'deleted',
-			'cancel',
-		);
-		foreach ($cancel_tokens as $token) {
-			if (strpos($value, $token) !== false) {
+		if (is_string($value)) {
+			$value = strtolower(trim($value));
+			if ($value === '') {
+				return false;
+			}
+
+			$truthy_values = array('1', 'true', 'yes', 'y', 'ja', 'oui');
+			if (in_array($value, $truthy_values, true)) {
 				return true;
 			}
+
+			$cancel_tokens = array(
+				'cancelled',
+				'canceled',
+				'vervallen',
+				'geannuleerd',
+				'annulering',
+				'rijdt niet',
+				'rijdtniet',
+				'rijdetniet',
+				'niet gereden',
+				'nietgereden',
+				'nietopgevoerd',
+				'notdriving',
+				'deleted',
+				'cancel',
+			);
+			// Use word-boundary regex matching so tokens inside other words/numbers
+			// do not accidentally trigger a cancellation.
+			foreach ($cancel_tokens as $token) {
+				$pattern = '/\b' . preg_quote($token, '/') . '\b/i';
+				if (preg_match($pattern, $value) === 1) {
+					return true;
+				}
+			}
+
+			return false;
 		}
 
 		return false;
 	}
 
-	return false;
-	}
 
 	/**
 	 * Detect cancellation tokens in free-form text without treating numeric
@@ -1178,18 +1182,20 @@ class OV_Halte_Importer {
 	 * cancellation flags.
 	 */
 	private static function detect_cancel_in_text($text) {
-	if (!is_string($text) || trim($text) === '') {
+		if (!is_string($text) || trim($text) === '') {
+			return false;
+		}
+		$value = strtolower(trim($text));
+		$cancel_tokens = array('cancelled','canceled','vervallen','geannuleerd','annulering','rijdt niet','rijdtniet','rijdetniet','niet gereden','nietgereden','nietopgevoerd','notdriving','deleted','cancel');
+		foreach ($cancel_tokens as $token) {
+			$pattern = '/\b' . preg_quote($token, '/') . '\b/i';
+			if (preg_match($pattern, $value) === 1) {
+				return true;
+			}
+		}
 		return false;
 	}
-	$value = strtolower(trim($text));
-	$cancel_tokens = array('cancelled','canceled','vervallen','geannuleerd','annulering','rijdt niet','rijdtniet','rijdetniet','niet gereden','nietgereden','nietopgevoerd','notdriving','deleted','cancel');
-	foreach ($cancel_tokens as $token) {
-		if (strpos($value, $token) !== false) {
-			return true;
-		}
-	}
-	return false;
-	}
+
 
 	private static function detect_cancel_in_text_recursive($item) {
 		if (is_string($item)) {
@@ -1265,16 +1271,15 @@ class OV_Halte_Importer {
 			$values = array();
 			$queries = array();
 			foreach ($chunk as $row) {
-				// expected_time may be an empty string; use NULLIF in the VALUES list
-				$queries[] = "(%s, %s, %d, %d, NULLIF(%s, ''), NOW())";
+				// Do not persist expected_time (unreliable). Store only journey_ref, stop_code, delay_seconds and is_cancelled.
+				$queries[] = "(%s, %s, %d, %d, NOW())";
 				$values[] = isset($row['journey_ref']) ? $row['journey_ref'] : '';
 				$values[] = isset($row['stop_code']) ? $row['stop_code'] : '';
 				$values[] = isset($row['delay_seconds']) ? (int) $row['delay_seconds'] : 0;
 				$values[] = isset($row['is_cancelled']) ? (int) $row['is_cancelled'] : 0;
-				$values[] = isset($row['expected_time']) ? $row['expected_time'] : '';
 			}
 
-			$sql = 'INSERT INTO ' . $table . ' (journey_ref, stop_code, delay_seconds, is_cancelled, expected_time, updated_at) VALUES ' . implode(', ', $queries) . ' ON DUPLICATE KEY UPDATE delay_seconds = VALUES(delay_seconds), is_cancelled = VALUES(is_cancelled), expected_time = VALUES(expected_time), updated_at = NOW()';
+			$sql = 'INSERT INTO ' . $table . ' (journey_ref, stop_code, delay_seconds, is_cancelled, updated_at) VALUES ' . implode(', ', $queries) . ' ON DUPLICATE KEY UPDATE delay_seconds = VALUES(delay_seconds), is_cancelled = VALUES(is_cancelled), updated_at = NOW()';
 			$result = $wpdb->query($wpdb->prepare($sql, $values));
 
 			if ($result === false) {
@@ -1436,11 +1441,36 @@ class OV_Halte_Importer {
 		}
 
 		$variants = array($journey_ref);
+		// If the journey_ref is namespaced (e.g. NL:...:longref), include the short last part
 		if (strpos($journey_ref, ':') !== false) {
 			$parts = explode(':', $journey_ref);
 			$short_ref = trim((string) end($parts));
 			if ($short_ref !== '' && $short_ref !== $journey_ref) {
 				$variants[] = $short_ref;
+			}
+		}
+
+		// If the ref contains only digits, include variants without leading zeros
+		if (preg_match('/^\d+$/', $journey_ref)) {
+			$no_leading = ltrim($journey_ref, '0');
+			if ($no_leading !== '' && $no_leading !== $journey_ref) {
+				$variants[] = $no_leading;
+			}
+			// Special-case: NS sometimes prefixes cancelled or special journey numbers with '300' (e.g. 3003617)
+			// Include a variant with the '300' prefix stripped so that matching still works
+			if (preg_match('/^300(\d{3,})$/', $journey_ref, $m)) {
+				$variants[] = $m[1];
+			}
+		}
+
+		// Also, if the short_ref (from namespaced ref) is numeric, apply the same numeric rules
+		if (isset($short_ref) && preg_match('/^\d+$/', $short_ref)) {
+			$no_leading = ltrim($short_ref, '0');
+			if ($no_leading !== '' && $no_leading !== $short_ref) {
+				$variants[] = $no_leading;
+			}
+			if (preg_match('/^300(\d{3,})$/', $short_ref, $m2)) {
+				$variants[] = $m2[1];
 			}
 		}
 
@@ -2262,9 +2292,36 @@ class OV_Halte_Importer {
 
 		$placeholders_j = implode(',', array_fill(0, count($journey_ref_variants), '%s'));
 		$placeholders_s = implode(',', array_fill(0, count($lookup_stop_codes), '%s'));
-		$query = 'SELECT journey_ref, delay_seconds, is_cancelled FROM ' . $table . ' WHERE journey_ref IN (' . $placeholders_j . ') AND stop_code IN (' . $placeholders_s . ') ORDER BY FIELD(journey_ref, ' . $placeholders_j . ') LIMIT 1';
-		$params = array_merge($journey_ref_variants, $lookup_stop_codes, $journey_ref_variants);
+		// Prefer an exact match on both journey_ref and stop_code. Order by the
+		// preferred journey_ref variants first, then by the preferred stop_code
+		// variants so the query returns the most relevant realtime row for the
+		// specific stop. Fall back to any variant if an exact match is not
+		// available.
+		$query = 'SELECT journey_ref, stop_code, delay_seconds, is_cancelled FROM ' . $table . ' WHERE journey_ref IN (' . $placeholders_j . ') AND stop_code IN (' . $placeholders_s . ') ORDER BY FIELD(journey_ref, ' . $placeholders_j . '), FIELD(stop_code, ' . $placeholders_s . ') LIMIT 1';
+		// Parameters: journey variants, stop variants, then repeated for the two FIELD() ordering calls
+		$params = array_merge($journey_ref_variants, $lookup_stop_codes, $journey_ref_variants, $lookup_stop_codes);
 		$row = $wpdb->get_row($wpdb->prepare($query, $params), ARRAY_A);
+
+		// Ensure the matched realtime row actually applies to the queried stop.
+		// If the stored row's stop_code does not match any of the lookup stop_code
+		// variants for this query, ignore the row entirely to avoid showing
+		// "Rijdt niet" at a stop where the cancellation applies elsewhere on
+		// the route.
+		if (!empty($row)) {
+			$stored_stop = isset($row['stop_code']) ? (string) $row['stop_code'] : '';
+			$stored_variants = self::get_realtime_stop_code_variants($stored_stop);
+			$match_found = false;
+			foreach ($stored_variants as $sv) {
+			    if (in_array($sv, $lookup_stop_codes, true)) {
+			        $match_found = true;
+			        break;
+			    }
+			}
+			if (!$match_found) {
+			    // Treat as no row found for this particular stop
+			    $row = null;
+			}
+		}
 
 		$res = array(
 			'delay_seconds' => (!empty($row) && isset($row['delay_seconds'])) ? (int) $row['delay_seconds'] : 0,
@@ -4090,14 +4147,33 @@ private static function parse_assignment(XMLReader $reader) {
 		}
 		// prefer explicit expected_time from realtime if provided
 		if (!empty($expected_time)) {
-			$ts = strtotime($expected_time);
-			if ($ts !== false) {
-				return date('H:i', $ts);
+			try {
+				// Interpret stored expected_time as UTC (no tz info) and convert to
+				// the site timezone for display. This avoids mismatches when the
+				// daemon writes a naive datetime in server-local time.
+				$site_tz = function_exists('wp_timezone') ? wp_timezone() : new DateTimeZone(date_default_timezone_get());
+				$utc = new DateTimeZone('UTC');
+				// First try strict Y-m-d H:i:s format as UTC
+				$dt = DateTime::createFromFormat('Y-m-d H:i:s', $expected_time, $utc);
+				if ($dt instanceof DateTime) {
+					$dt->setTimezone($site_tz);
+					return $dt->format('H:i');
+				}
+				// Fallback: attempt to parse with DateTime assuming UTC
+				$dt2 = new DateTime($expected_time, $utc);
+				if ($dt2 instanceof DateTime) {
+					$dt2->setTimezone($site_tz);
+					return $dt2->format('H:i');
+				}
+			} catch (Throwable $e) {
+				// parsing failed — ignore and fall back to delay display
 			}
 		}
+
 		if (empty($delay_seconds)) {
 			return $time_html;
 		}
+
 		$sign = (int) $delay_seconds > 0 ? '+' : '-';
 		$minutes = (int) floor((abs((int) $delay_seconds) + 59) / 60);
 		$color = (int) $delay_seconds > 0 ? '#d00' : '#0a0';

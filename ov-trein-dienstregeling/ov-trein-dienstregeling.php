@@ -3126,15 +3126,88 @@ class OV_Trein_Dienstregeling {
 			return null;
 		}
 
-		$candidates = array($journey_ref);
+		// Enable debug logging when ?ovtd_debug=1 is present in the URL.
+		$debug_enabled = (isset($_GET['ovtd_debug']) && $_GET['ovtd_debug'] === '1');
+
+		// Prefer station-specific match first, then fallback to journey-level.
+		$candidates = array();
 		if ($station_code !== '') {
 			$candidates[] = $journey_ref . '|' . $station_code;
 		}
+		$candidates[] = $journey_ref;
+
+		global $wpdb;
+		$journey_stops_table = self::table('journey_stops');
+		$realtime_table = $wpdb->prefix . 'ovhi_realtime_delays';
+
+		// Pre-fetch the station order for the queried station (if any) so we can
+		// reason about relative positions on the route.
+		$station_order = null;
+		if ($station_code !== '') {
+			$station_order = $wpdb->get_var(
+			$wpdb->prepare("SELECT stop_order FROM {$journey_stops_table} WHERE journey_ref = %s AND station_code = %s LIMIT 1", $journey_ref, $station_code)
+			);
+		}
+
+
 		foreach ($candidates as $candidate) {
-			if (isset($delays[$candidate]) && is_array($delays[$candidate])) {
-				return $delays[$candidate];
+			if (!isset($delays[$candidate]) || !is_array($delays[$candidate])) {
+			continue;
+			}
+			$delay = $delays[$candidate];
+			$delay_stop = isset($delay['stop_code']) ? strtolower(trim((string) $delay['stop_code'])) : '';
+			$is_cancelled = !empty($delay['is_cancelled']);
+			$delay_seconds = isset($delay['delay_seconds']) ? (int) $delay['delay_seconds'] : 0;
+
+			// If the delay row explicitly targets the queried station, accept it.
+			if ($delay_stop === $station_code && $station_code !== '') {
+			return $delay;
+			}
+
+			// If the delay targets a different stop, ensure the cancellation/delay
+			// logically applies to this station by comparing stop order in the
+			// scheduled journey. Only apply if the delay stop is the same or
+			// earlier than the queried station. If we cannot determine order,
+			// be conservative and skip this delay to avoid false positives.
+			if ($delay_stop !== '' && $station_code !== '') {
+			$delay_order = $wpdb->get_var(
+				$wpdb->prepare("SELECT stop_order FROM {$journey_stops_table} WHERE journey_ref = %s AND station_code = %s LIMIT 1", $journey_ref, $delay_stop)
+			);
+			if ($delay_order === null || $station_order === null) {
+				continue;
+			}
+			if ((int) $delay_order <= (int) $station_order) {
+				return $delay;
+			}
+			continue;
+			}
+
+			// If we reach here the delay row has no explicit stop_code (a
+			// journey-level report). Be conservative: if there exists any
+			// station-specific cancellation for this journey that occurs later
+			// than the queried station, we should NOT treat the generic
+			// cancellation as applying to this earlier stop.
+			if ($delay_stop === '' && $is_cancelled && $station_code !== '' && $station_order !== null) {
+			$latest_cancel_order = $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT MAX(js.stop_order) FROM {$journey_stops_table} js JOIN {$realtime_table} rd ON rd.journey_ref = js.journey_ref AND LOWER(js.station_code) = LOWER(rd.stop_code) WHERE rd.journey_ref = %s AND rd.is_cancelled = 1 AND rd.stop_code <> ''",
+					$journey_ref
+					)
+			);
+			if ($latest_cancel_order !== null && (int) $latest_cancel_order > (int) $station_order) {
+				continue;
+			}
+			return $delay;
+			}
+
+			// Lastly, if there is a generic (no stop_code) non-cancellation report
+			// such as a global delay value, accept it only if no stronger
+			// station-specific data exists. For simplicity we accept it here.
+			if ($delay_stop === '' && !$is_cancelled) {
+			return $delay;
 			}
 		}
+
 
 		return null;
 	}

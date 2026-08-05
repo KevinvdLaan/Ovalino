@@ -137,15 +137,14 @@ class DelayDatabase:
             try:
                 cursor = self.conn.cursor()
                 sql = f"""
-                    INSERT INTO {self.table_name} (journey_ref, stop_code, delay_seconds, is_cancelled, expected_time, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, NOW())
+                    INSERT INTO {self.table_name} (journey_ref, stop_code, delay_seconds, is_cancelled, updated_at)
+                    VALUES (%s, %s, %s, %s, NOW())
                     ON DUPLICATE KEY UPDATE
                         delay_seconds = VALUES(delay_seconds),
                         is_cancelled = VALUES(is_cancelled),
-                        expected_time = VALUES(expected_time),
                         updated_at = NOW()
                 """
-                params = (journey_ref, stop_code, int(delay_seconds), 1 if is_cancelled else 0, expected_time)
+                params = (journey_ref, stop_code, int(delay_seconds), 1 if is_cancelled else 0)
                 cursor.execute(sql, params)
                 cursor.close()
             except Exception as e:
@@ -182,6 +181,22 @@ def parse_iso_duration(duration_str):
     minutes = int(match.group(2) or 0)
     seconds = int(match.group(3) or 0)
     return hours * 3600 + minutes * 60 + seconds
+
+
+def token_in_text(text, tokens):
+    """Return True if any token is found as a whole word in text (case-insensitive)."""
+    if not text:
+        return False
+    for token in tokens:
+        # Use word boundaries to avoid matching substrings inside other words/numbers
+        try:
+            if re.search(r"\b" + re.escape(token) + r"\b", text, re.IGNORECASE):
+                return True
+        except re.error:
+            # Fallback simple containment if regex fails for any token
+            if token.upper() in text.upper():
+                return True
+    return False
 
 
 def strip_namespace(tag):
@@ -404,9 +419,22 @@ class InfoPlusSubscriber(threading.Thread):
 
     def process_rit_info(self, rit_info):
         train_num = find_text_any(rit_info, ['TreinNummer', 'RitId', 'RitNummer', 'LogischeRitNummer', 'JourneyRef'])
-        station_code = find_text_any(rit_info, ['StationCode', 'Station', 'StopCode', 'HalteCode'])
+        # Prefer explicit stop identifiers when present. If only an ambiguous
+        # Station field is present, treat the stop as non-precise so that a
+        # cancellation message that lacks a precise stop won't be blindly
+        # applied to the original departure station.
+        preferred_stop_tags = ['UserStopCode','StopPointRef','ScheduledStopPointRef','TimingPointCode','QuayCode','StationCode','StopCode','HalteCode','Station']
+        station_code = find_text_any(rit_info, preferred_stop_tags)
         if not train_num or not station_code:
             return
+
+        # Determine whether the message includes an explicit precise stop tag
+        try:
+            raw_xml_check = ET.tostring(rit_info, encoding='utf-8', method='xml').decode('utf-8').lower()
+        except Exception:
+            raw_xml_check = ''
+        precise_tags = ['userstopcode','stoppointref','scheduledstoppointref','timingpointcode','quaycode','stationcode','stopcode','haltecode']
+        precise_stop_found = any((('<' + t) in raw_xml_check) or (t + '=') in raw_xml_check for t in precise_tags)
 
         station_code = station_code.strip()
         m = re.match(r'^(?:nl:q:)(\d+)$', station_code, re.IGNORECASE)
@@ -432,13 +460,43 @@ class InfoPlusSubscriber(threading.Thread):
             pass
 
         cancel_tokens = ('CANCEL', 'VERVALLEN', 'RIJDETNIET', 'RIJDT NIET', 'NOTDRIVING', 'DELETED')
-        if any(token in status_text for token in cancel_tokens) or any(token in detail_text for token in cancel_tokens):
+        # Use whole-word/token matching to reduce false positives from unrelated fields
+        status_has_cancel = token_in_text(status_text, cancel_tokens)
+        detail_has_cancel = token_in_text(detail_text, cancel_tokens)
+
+        # Collect numeric IDs mentioned in the element (e.g. '300778') to avoid applying
+        # a cancellation message that explicitly targets a different train number.
+        raw_text_all = ''.join((child.text or '') + ''.join(child.attrib.values()) for child in rit_info.iter())
+        numeric_ids = re.findall(r"\b(\d{3,})\b", raw_text_all)
+
+        def cancel_appears_to_target_train(train_id, numeric_list):
+            """Heuristic: if the message contains explicit numeric IDs, treat the
+            cancellation as applying only when one of those IDs matches this train
+            (or a common variant like '300'+train_id). If no numeric IDs are
+            present, fall back to token-only matching and allow it to apply.
+            """
+            if numeric_list:
+                try:
+                    t = str(int(train_id))
+                except Exception:
+                    t = train_id
+                variants = {t, '300' + t}
+                for n in numeric_list:
+                    if n in variants:
+                        return True
+                return False
+            return True
+
+        # Only apply cancellation if the message appears to target this train
+        # and the message either contains explicit numeric ids (e.g. 300778) or a
+        # precise stop identifier was found in the payload. This avoids blindly
+        # applying ambiguous notices to the original departure station.
+        if (status_has_cancel or detail_has_cancel) and cancel_appears_to_target_train(train_num, numeric_ids) and (numeric_ids or precise_stop_found):
             is_cancelled = True
 
         if not is_cancelled:
-            raw_text = ''.join((child.text or '') + ''.join(child.attrib.values()) for child in rit_info.iter())
-            upper_text = raw_text.upper()
-            if any(token in upper_text for token in cancel_tokens):
+            # search raw_text with token_in_text which uses word-boundary regex
+            if token_in_text(raw_text_all, cancel_tokens) and cancel_appears_to_target_train(train_num, numeric_ids) and (numeric_ids or precise_stop_found):
                 is_cancelled = True
             if not is_cancelled:
                 for child in rit_info.iter():
@@ -474,6 +532,39 @@ class InfoPlusSubscriber(threading.Thread):
         except Exception:
             expected_time = None
 
+        # If feed provides an expected time but not an explicit delay, try to
+        # derive delay_seconds from a scheduled/planned time present in the
+        # same message (without persisting expected_time). This keeps
+        # frontend behaviour relying on delay_seconds while avoiding storing
+        # the fragile expected_time value.
+        if delay_seconds == 0 and expected_time is not None:
+            try:
+                sched_text = find_text_any(rit_info, ['PlannedDepartureTime','PlannedTime','PlannedArrivalTime','TargetDepartureTime','TargetArrivalTime','ScheduledDepartureTime','ScheduledTime','VertrekTijd','GeplandeVertrekTijd'])
+                if sched_text:
+                    # parse scheduled time (accept ISO or HH:MM[:SS])
+                    try:
+                        if re.match(r'\d{4}-\d{2}-\d{2}T', sched_text):
+                            sched_dt = datetime.fromisoformat(re.search(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', sched_text).group(1))
+                        elif re.match(r'\d{2}:\d{2}(:\d{2})?$', sched_text):
+                            t = datetime.strptime(sched_text if sched_text.count(':')==2 else sched_text + ':00', '%H:%M:%S')
+                            today = datetime.now()
+                            sched_dt = today.replace(hour=t.hour, minute=t.minute, second=getattr(t,'second',0), microsecond=0)
+                        else:
+                            sched_dt = None
+                        if sched_dt is not None:
+                            exp_dt = datetime.strptime(expected_time, '%Y-%m-%d %H:%M:%S')
+                            delta = int((exp_dt - sched_dt).total_seconds())
+                            # Adjust for day rollovers
+                            if delta < -43200:
+                                delta += 86400
+                            elif delta > 43200:
+                                delta -= 86400
+                            delay_seconds = delta
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
         self.db.upsert_delay(train_num, station_code, delay_seconds, is_cancelled, expected_time)
 
     def process_dvs(self, dvs):
@@ -483,6 +574,13 @@ class InfoPlusSubscriber(threading.Thread):
             return
 
         station_code = station_code.strip()
+        try:
+            raw_xml_check = ET.tostring(dvs, encoding='utf-8', method='xml').decode('utf-8').lower()
+        except Exception:
+            raw_xml_check = ''
+        precise_tags = ['userstopcode','stoppointref','scheduledstoppointref','timingpointcode','quaycode','stationcode','stopcode','haltecode']
+        precise_stop_found = any((('<' + t) in raw_xml_check) or (t + '=') in raw_xml_check for t in precise_tags)
+
         m = re.match(r'^(?:nl:q:)(\d+)$', station_code, re.IGNORECASE)
         if m:
             station_code = f"NL:Q:{m.group(1)}"
@@ -512,13 +610,37 @@ class InfoPlusSubscriber(threading.Thread):
             pass
 
         cancel_tokens = ('CANCEL', 'VERVALLEN', 'RIJDETNIET', 'RIJDT NIET', 'NOTDRIVING', 'DELETED')
-        if any(token in status_text for token in cancel_tokens) or any(token in detail_text for token in cancel_tokens):
+        # Use whole-word/token matching to reduce false positives from unrelated fields
+        status_has_cancel = token_in_text(status_text, cancel_tokens)
+        detail_has_cancel = token_in_text(detail_text, cancel_tokens)
+
+        # Collect numeric IDs mentioned in the element (e.g. '300778') to avoid applying
+        # a cancellation message that explicitly targets a different train number.
+        raw_text_all = ''.join((child.text or '') + ''.join(child.attrib.values()) for child in dvs.iter())
+        numeric_ids = re.findall(r"\b(\d{3,})\b", raw_text_all)
+
+        def cancel_appears_to_target_train(train_id, numeric_list):
+            if numeric_list:
+                try:
+                    t = str(int(train_id))
+                except Exception:
+                    t = train_id
+                variants = {t, '300' + t}
+                for n in numeric_list:
+                    if n in variants:
+                        return True
+                return False
+            return True
+
+        # Only apply cancellation if the message appears to target this train
+        # and the message either contains explicit numeric ids (e.g. 300778) or a
+        # precise stop identifier was found in the payload.
+        if (status_has_cancel or detail_has_cancel) and cancel_appears_to_target_train(train_num, numeric_ids) and (numeric_ids or precise_stop_found):
             is_cancelled = True
 
         if not is_cancelled:
-            raw_text = ''.join((child.text or '') + ''.join(child.attrib.values()) for child in dvs.iter())
-            upper_text = raw_text.upper()
-            if any(token in upper_text for token in cancel_tokens):
+            # search raw_text with token_in_text which uses word-boundary regex
+            if token_in_text(raw_text_all, cancel_tokens) and cancel_appears_to_target_train(train_num, numeric_ids) and (numeric_ids or precise_stop_found):
                 is_cancelled = True
             if not is_cancelled:
                 for child in dvs.iter():
@@ -554,6 +676,33 @@ class InfoPlusSubscriber(threading.Thread):
                     expected_time = dt.strftime('%Y-%m-%d %H:%M:%S')
         except Exception:
             expected_time = None
+
+        # If expected_time is present but no explicit delay, try to derive delay_seconds
+        if delay_seconds == 0 and expected_time is not None:
+            try:
+                sched_text = find_text_any(dvs, ['PlannedDepartureTime','PlannedTime','PlannedArrivalTime','TargetDepartureTime','TargetArrivalTime','ScheduledDepartureTime','ScheduledTime','VertrekTijd','GeplandeVertrekTijd'])
+                if sched_text:
+                    try:
+                        if re.match(r'\d{4}-\d{2}-\d{2}T', sched_text):
+                            sched_dt = datetime.fromisoformat(re.search(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', sched_text).group(1))
+                        elif re.match(r'\d{2}:\d{2}(:\d{2})?$', sched_text):
+                            t = datetime.strptime(sched_text if sched_text.count(':')==2 else sched_text + ':00', '%H:%M:%S')
+                            today = datetime.now()
+                            sched_dt = today.replace(hour=t.hour, minute=t.minute, second=getattr(t,'second',0), microsecond=0)
+                        else:
+                            sched_dt = None
+                        if sched_dt is not None:
+                            exp_dt = datetime.strptime(expected_time, '%Y-%m-%d %H:%M:%S')
+                            delta = int((exp_dt - sched_dt).total_seconds())
+                            if delta < -43200:
+                                delta += 86400
+                            elif delta > 43200:
+                                delta -= 86400
+                            delay_seconds = delta
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
         self.db.upsert_delay(train_num, station_code, delay_seconds, is_cancelled, expected_time)
 
