@@ -749,6 +749,12 @@ class OV_Lijn_Dienstregeling {
 			if (!empty($stop['quay_code'])) {
 				$stop_codes[] = $stop['quay_code'];
 			}
+			if (!empty($stop['user_stop_code'])) {
+				$stop_codes[] = $stop['user_stop_code'];
+			}
+			if (!empty($stop['scheduled_stop_point_ref'])) {
+				$stop_codes[] = $stop['scheduled_stop_point_ref'];
+			}
 		}
 		$realtime_delay_map = self::get_realtime_delay_map($journey_refs, $stop_codes);
 		$link_map = self::get_stop_page_links();
@@ -824,12 +830,18 @@ class OV_Lijn_Dienstregeling {
 								?>
 								<?php
 								$delay = array('delay_seconds' => 0, 'is_cancelled' => false);
-								if (!empty($stop['quay_code'])) {
-									$delay_key = self::get_realtime_delay_map_key($journey['journey_ref'], $stop['quay_code']);
+								$candidate_stop_codes = array();
+								if (!empty($stop['quay_code'])) $candidate_stop_codes[] = $stop['quay_code'];
+								if (!empty($stop['user_stop_code'])) $candidate_stop_codes[] = $stop['user_stop_code'];
+								if (!empty($stop['scheduled_stop_point_ref'])) $candidate_stop_codes[] = $stop['scheduled_stop_point_ref'];
+
+								foreach ($candidate_stop_codes as $s_code) {
+									$delay_key = self::get_realtime_delay_map_key($journey['journey_ref'], $s_code);
 									if ($delay_key !== '' && isset($realtime_delay_map[$delay_key])) {
 										$scheduled_ts = self::timestamp_from_service_seconds($service_date, (int) $journey['departure_seconds'] + (int) $offsets[$key]);
-										if ($scheduled_ts <= (current_time('timestamp') + 2 * HOUR_IN_SECONDS)) {
+										if ($scheduled_ts <= (time() + 2 * HOUR_IN_SECONDS)) {
 											$delay = $realtime_delay_map[$delay_key];
+											break;
 										}
 									}
 								}
@@ -901,12 +913,18 @@ class OV_Lijn_Dienstregeling {
 								$key = $journey['service_journey_pattern_ref'] . '|' . $journey['time_demand_type_ref'] . '|' . $stop['scheduled_stop_point_ref'];
 								$time = isset($offsets[$key]) ? self::format_seconds((int) $journey['departure_seconds'] + (int) $offsets[$key]) : '';
 								$delay = array('delay_seconds' => 0, 'is_cancelled' => false);
-								if (!empty($stop['quay_code'])) {
-									$delay_key = self::get_realtime_delay_map_key($journey['journey_ref'], $stop['quay_code']);
+								$candidate_stop_codes = array();
+								if (!empty($stop['quay_code'])) $candidate_stop_codes[] = $stop['quay_code'];
+								if (!empty($stop['user_stop_code'])) $candidate_stop_codes[] = $stop['user_stop_code'];
+								if (!empty($stop['scheduled_stop_point_ref'])) $candidate_stop_codes[] = $stop['scheduled_stop_point_ref'];
+
+								foreach ($candidate_stop_codes as $s_code) {
+									$delay_key = self::get_realtime_delay_map_key($journey['journey_ref'], $s_code);
 									if ($delay_key !== '' && isset($realtime_delay_map[$delay_key])) {
 										$scheduled_ts = self::timestamp_from_service_seconds($service_date, (int) $journey['departure_seconds'] + (int) $offsets[$key]);
-										if ($scheduled_ts <= (current_time('timestamp') + 2 * HOUR_IN_SECONDS)) {
+										if ($scheduled_ts <= (time() + 2 * HOUR_IN_SECONDS)) {
 											$delay = $realtime_delay_map[$delay_key];
+											break;
 										}
 									}
 								}
@@ -951,13 +969,18 @@ class OV_Lijn_Dienstregeling {
 						continue;
 					}
 						$delay = array('delay_seconds' => 0, 'is_cancelled' => false);
-						if (!empty($stop['quay_code'])) {
-							$delay_key = self::get_realtime_delay_map_key($journey['journey_ref'], $stop['quay_code']);
+						$candidate_stop_codes = array();
+						if (!empty($stop['quay_code'])) $candidate_stop_codes[] = $stop['quay_code'];
+						if (!empty($stop['user_stop_code'])) $candidate_stop_codes[] = $stop['user_stop_code'];
+						if (!empty($stop['scheduled_stop_point_ref'])) $candidate_stop_codes[] = $stop['scheduled_stop_point_ref'];
+
+						foreach ($candidate_stop_codes as $s_code) {
+							$delay_key = self::get_realtime_delay_map_key($journey['journey_ref'], $s_code);
 							if ($delay_key !== '' && isset($realtime_delay_map[$delay_key])) {
-								// Only apply realtime delay if the scheduled departure is within the next 2 hours
 								$scheduled_ts = self::timestamp_from_service_seconds($service_date, (int) $journey['departure_seconds'] + (int) $offsets[$key]);
-								if ($scheduled_ts <= (current_time('timestamp') + 2 * HOUR_IN_SECONDS)) {
+								if ($scheduled_ts <= (time() + 2 * HOUR_IN_SECONDS)) {
 									$delay = $realtime_delay_map[$delay_key];
+									break;
 								}
 							}
 						}

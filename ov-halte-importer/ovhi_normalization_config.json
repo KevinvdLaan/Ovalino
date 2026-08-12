@@ -1,0 +1,5 @@
+{
+  "enabled": true,
+  "coverage_threshold": 0.5,
+  "merge_tolerance_seconds": 120
+}

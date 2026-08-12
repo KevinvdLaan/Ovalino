@@ -954,7 +954,7 @@ class Ovalino_Map {
 		if (!empty($lookup_journey_refs) && (bool) $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $realtime_table))) {
 			$j_placeholders = implode(',', array_fill(0, count($lookup_journey_refs), '%s'));
 			$station_placeholders = implode(',', array_fill(0, count($normalized_station_codes), '%s'));
-			$one_hour_ago = date('Y-m-d H:i:s', time() - 3600);
+			$one_hour_ago = gmdate('Y-m-d H:i:s', time() - HOUR_IN_SECONDS);
 			$params_delay = array_merge($lookup_journey_refs, $normalized_station_codes, array($one_hour_ago));
 			$delay_rows = $wpdb->get_results($wpdb->prepare(
 				"SELECT journey_ref, stop_code, delay_seconds, is_cancelled, expected_time FROM $realtime_table WHERE journey_ref IN ($j_placeholders) AND stop_code IN ($station_placeholders) AND updated_at >= %s",
@@ -964,7 +964,23 @@ class Ovalino_Map {
 				foreach ($delay_rows as $d_row) {
 					$matched_refs = isset($scheduled_refs_by_lookup[$d_row['journey_ref']]) ? $scheduled_refs_by_lookup[$d_row['journey_ref']] : array($d_row['journey_ref']);
 					foreach ($matched_refs as $matched_ref) {
-						$delay_map[$matched_ref . '|' . strtolower($d_row['stop_code'])] = $d_row;
+						// Try to determine the scheduled timestamp for the delay's source stop
+						$d_row_copy = $d_row;
+						try {
+						    $dep_sec = $wpdb->get_var($wpdb->prepare(
+						        'SELECT departure_seconds FROM ' . self::table('ovtd', 'journey_stops') . ' WHERE journey_ref = %s AND LOWER(station_code) = %s LIMIT 1',
+						        $matched_ref,
+						        strtolower($d_row['stop_code'])
+						    ));
+						    if ($dep_sec !== null && $dep_sec !== false && $dep_sec !== '') {
+						        $d_row_copy['source_scheduled_ts'] = self::timestamp_from_service_seconds($service_date, (int) $dep_sec);
+						    } else {
+						        $d_row_copy['source_scheduled_ts'] = null;
+						    }
+						} catch (Exception $e) {
+						    $d_row_copy['source_scheduled_ts'] = null;
+						}
+						$delay_map[$matched_ref . '|' . strtolower($d_row['stop_code'])] = $d_row_copy;
 					}
 				}
 			}
@@ -1026,15 +1042,43 @@ class Ovalino_Map {
 			// train_number kan matchen). Val terug op de kolommen uit de query indien
 			// geen realtime-waarde beschikbaar is.
 			$key_for_delay = (isset($row['journey_ref']) ? $row['journey_ref'] : '') . '|' . strtolower($station_code);
+			// Default merge tolerance (seconds) used to avoid mapping delays from a different stop
+			$merge_tolerance_seconds = 120;
+
 			if ($key_for_delay !== '' && isset($delay_map[$key_for_delay])) {
-				$delay_seconds = isset($delay_map[$key_for_delay]['delay_seconds']) ? (int) $delay_map[$key_for_delay]['delay_seconds'] : 0;
-				$is_cancelled = !empty($delay_map[$key_for_delay]['is_cancelled']);
-				$expected_time = isset($delay_map[$key_for_delay]['expected_time']) ? $delay_map[$key_for_delay]['expected_time'] : null;
+				$candidate = $delay_map[$key_for_delay];
+				$apply_candidate = true;
+				if (isset($candidate['source_scheduled_ts']) && $candidate['source_scheduled_ts'] !== null) {
+				    // Only apply the realtime value if the source stop's scheduled timestamp
+				    // matches the current scheduled timestamp within the tolerance.
+				    $apply_candidate = abs((int)$candidate['source_scheduled_ts'] - (int)$ts) <= $merge_tolerance_seconds;
+				}
+
+				if ($apply_candidate) {
+				    $delay_seconds = isset($candidate['delay_seconds']) ? (int) $candidate['delay_seconds'] : 0;
+				    $is_cancelled = !empty($candidate['is_cancelled']);
+				    $expected_time = isset($candidate['expected_time']) ? $candidate['expected_time'] : null;
+				} else {
+				    // Candidate seems to belong to a different stop/time — fall back to scheduled values
+				    $delay_seconds = isset($row['delay_seconds']) ? (int) $row['delay_seconds'] : 0;
+				    $is_cancelled = !empty($row['is_cancelled']);
+				    $expected_time = isset($row['expected_time']) ? $row['expected_time'] : null;
+				}
 			} else {
 				$delay_seconds = isset($row['delay_seconds']) ? (int) $row['delay_seconds'] : 0;
 				$is_cancelled = !empty($row['is_cancelled']);
 				$expected_time = isset($row['expected_time']) ? $row['expected_time'] : null;
-			}			$visibility_ts = self::calculate_visibility_cutoff($ts, $delay_seconds);
+			}
+			// expected_time is the actual, live departure. Accept it only when it
+			// agrees with scheduled time + reported delay; otherwise it belongs to
+			// another reused train number/stop and must not leak into this popup.
+			$expected_ts = !empty($expected_time) ? self::parse_expected_time_to_timestamp($expected_time) : 0;
+			$reported_ts = $ts + (int) $delay_seconds;
+			if ($expected_ts > 0 && abs($expected_ts - $reported_ts) > 30 * MINUTE_IN_SECONDS) {
+				$expected_time = null;
+				$expected_ts = 0;
+			}
+			$visibility_ts = $expected_ts > 0 ? $expected_ts + MINUTE_IN_SECONDS : self::calculate_visibility_cutoff($ts, $delay_seconds);
 
 			if ($visibility_ts >= $now && $ts <= $two_hours_later) {
 				$timezone = wp_timezone();
@@ -1057,6 +1101,75 @@ class Ovalino_Map {
 					'timestamp' => $ts
 				);
 				$seen_direction_per_station[$station_code][] = $direction_ref;
+			}
+		}
+
+		// Fetch replacement / extra trains from realtime delays and add them to departures_by_station
+		if (!empty($normalized_station_codes) && (bool) $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $realtime_table))) {
+			try {
+				$one_hour_ago = gmdate('Y-m-d H:i:s', time() - HOUR_IN_SECONDS);
+				$st_placeholders = implode(',', array_fill(0, count($normalized_station_codes), '%s'));
+				$params_extra = array_merge($normalized_station_codes, array($one_hour_ago));
+				$extra_delay_rows = $wpdb->get_results(
+					$wpdb->prepare(
+						"SELECT journey_ref, stop_code, delay_seconds, is_cancelled, expected_time, is_extra_train FROM $realtime_table WHERE stop_code IN ($st_placeholders) AND updated_at >= %s",
+						...$params_extra
+					),
+					ARRAY_A
+				);
+				if (!empty($extra_delay_rows)) {
+					foreach ($extra_delay_rows as $erow) {
+						$jref = trim((string) $erow['journey_ref']);
+						$base_num = class_exists('OV_Trein_Dienstregeling')
+							? OV_Trein_Dienstregeling::extract_base_train_number($jref)
+							: null;
+						if (empty($erow['is_extra_train']) || $base_num === null || $base_num === $jref) continue;
+
+						$exp_time = !empty($erow['expected_time']) ? $erow['expected_time'] : '';
+						$ts = !empty($exp_time) ? self::parse_expected_time_to_timestamp($exp_time) : 0;
+						if (!$ts || $ts < $now || $ts > $two_hours_later) continue;
+
+						$st_code = strtolower(trim((string) $erow['stop_code']));
+						// Only include if station is among the ones we're displaying
+						if (!in_array($st_code, $normalized_station_codes, true)) continue;
+
+						if (!isset($departures_by_station[$st_code])) {
+							$departures_by_station[$st_code] = array();
+						}
+
+						$base_info = $wpdb->get_row(
+							$wpdb->prepare(
+								'SELECT d.train_type, d.line_code, d.destination_name FROM ' . self::table('ovtd', 'journeys') . ' j LEFT JOIN ' . self::table('ovtd', 'directions') . ' d ON d.direction_ref = j.direction_ref WHERE j.train_number = %s LIMIT 1',
+								$base_num
+							),
+							ARRAY_A
+						);
+						$train_type = !empty($base_info['train_type']) ? $base_info['train_type'] : 'IC';
+						$line_code  = !empty($base_info['line_code'])  ? $base_info['line_code']  : '';
+						$dest_name  = !empty($base_info['destination_name']) ? $base_info['destination_name'] : '';
+
+						// Use same line badge as regular trains (line_code if set, otherwise abbreviated train type)
+						$line_badge = class_exists('OV_Trein_Dienstregeling')
+							? OV_Trein_Dienstregeling::get_line_badge($train_type, $line_code)
+							: strtoupper($train_type);
+
+						$dt = (new DateTimeImmutable('@' . $ts))->setTimezone(wp_timezone());
+						$departures_by_station[$st_code][] = array(
+							'line'          => $line_badge,
+							'destination'   => $dest_name,
+							'time'          => $dt->format('H:i'),
+							'delay_seconds' => (int) $erow['delay_seconds'],
+							'is_cancelled'  => !empty($erow['is_cancelled']),
+							'is_extra'      => true,
+							'expected_time' => $exp_time,
+							'lineRef'       => '',
+							'direction'     => '',
+							'timestamp'     => $ts,
+						);
+					}
+				}
+			} catch (Exception $e) {
+				// Silently ignore errors from the extra-trains query so regular trains still show
 			}
 		}
 
@@ -1198,6 +1311,38 @@ class Ovalino_Map {
 		return $dt->format('Y-m-d');
 	}
 
+	private static function parse_expected_time_to_timestamp($expected_time) {
+		$expected_time = trim((string) $expected_time);
+		if ($expected_time === '') {
+			return 0;
+		}
+
+		$timezone = wp_timezone();
+		if (!is_object($timezone)) {
+			$timezone = new DateTimeZone('UTC');
+		}
+
+		try {
+			if (preg_match('/^\d{2}:\d{2}(?::\d{2})?$/', $expected_time)) {
+				$now = new DateTimeImmutable('now', $timezone);
+				$dt = new DateTimeImmutable($now->format('Y-m-d') . ' ' . $expected_time, $timezone);
+				if ($dt->getTimestamp() < time() - 12 * HOUR_IN_SECONDS) {
+					$dt = $dt->modify('+1 day');
+				}
+				return $dt->getTimestamp();
+			}
+
+			if (preg_match('/(?:[zZ]|[+\-]\d{2}:?\d{2})$/', $expected_time)) {
+				$dt = new DateTimeImmutable($expected_time);
+			} else {
+				$dt = new DateTimeImmutable($expected_time, $timezone);
+			}
+			return $dt->getTimestamp();
+		} catch (Exception $e) {
+			return 0;
+		}
+	}
+
 	private static function get_train_operational_window($now) {
 		$timezone = wp_timezone();
 		$dt_now = new DateTimeImmutable('@' . $now);
@@ -1213,11 +1358,11 @@ class Ovalino_Map {
 
 	private static function calculate_visibility_cutoff($scheduled_ts, $delay_seconds) {
 		$delay_seconds = max(0, (int) $delay_seconds);
-		$extra = defined('MINUTE_IN_SECONDS') ? MINUTE_IN_SECONDS : 60;
+		$minute = defined('MINUTE_IN_SECONDS') ? MINUTE_IN_SECONDS : 60;
 		if ($delay_seconds > 0) {
-			return $scheduled_ts + $delay_seconds + $extra;
+			return $scheduled_ts + $delay_seconds + $minute;
 		}
-		return $scheduled_ts;
+		return $scheduled_ts + (15 * $minute);
 	}
 
 	private static function timestamp_from_service_seconds($service_date, $seconds) {

@@ -2,7 +2,7 @@
 /**
  * Plugin Name: OV Halte Importer
  * Description: Upload CHB-, PassengerStopAssignment- en NeTEx-bestanden en toon automatisch lijnen en bestemmingen per halte via shortcode.
- * Version: 1.3.7
+ * Version: 1.3.9
  * Author: Kevin van der Laan
  * License: GPL-2.0-or-later
  */
@@ -12,7 +12,7 @@ if (!defined('ABSPATH')) {
 }
 
 class OV_Halte_Importer {
-	const VERSION = '1.3.7';
+	const VERSION = '1.3.9';
 	const OPTION_IMPORT_INFO = 'ovhi_import_info';
 	const OPTION_LIVE_DELAY_SETTINGS = 'ovhi_live_delay_settings';
 	const OPTION_LIVE_DELAY_LAST_SYNC = 'ovhi_live_delay_last_sync';
@@ -25,6 +25,8 @@ class OV_Halte_Importer {
 	private static $runtime_table_prefix = '';
 
 	public static function init() {
+		// dbDelta/ALTER statements are idempotent; run migrations after plugin updates too.
+		self::migrate_tables();
 		register_activation_hook(__FILE__, array(__CLASS__, 'activate'));
 		add_action('admin_menu', array(__CLASS__, 'admin_menu'));
 		add_action('admin_post_ovhi_upload', array(__CLASS__, 'handle_upload'));
@@ -77,6 +79,40 @@ class OV_Halte_Importer {
 
 		$data = json_decode($blob, true);
 		return is_array($data) ? $data : array();
+	}
+
+	/**
+	 * Load cancel-normalization settings.
+	 * Priority: WP option 'ovhi_cancel_normalization_settings' (array) -> JSON file next to plugin -> defaults
+	 */
+	private static function get_cancel_normalization_settings() {
+		$defaults = array(
+			'enabled' => true,
+			'coverage_threshold' => 0.5,
+			'merge_tolerance_seconds' => 120,
+		);
+
+		// Try WP option first (admin can set via settings page later)
+		if (function_exists('get_option')) {
+			$opt = get_option('ovhi_cancel_normalization_settings', null);
+			if (!empty($opt) && is_array($opt)) {
+				return array_merge($defaults, $opt);
+			}
+		}
+
+		// Fallback: JSON file beside the plugin for environments without WP option access
+		$config_file = dirname(__FILE__) . DIRECTORY_SEPARATOR . 'ovhi_normalization_config.json';
+		if (file_exists($config_file)) {
+			$raw = @file_get_contents($config_file);
+			if ($raw !== false) {
+				$parsed = json_decode($raw, true);
+				if (is_array($parsed)) {
+					return array_merge($defaults, $parsed);
+				}
+			}
+		}
+
+		return $defaults;
 	}
 
 	private static function get_table_suffixes() {
@@ -278,6 +314,9 @@ class OV_Halte_Importer {
 			delay_seconds int(11) NOT NULL default 0,
 			is_cancelled tinyint(1) NOT NULL default 0,
 			expected_time datetime NULL default NULL,
+			service_date date NULL default NULL,
+			change_type smallint(5) unsigned NOT NULL default 0,
+			is_extra_train tinyint(1) NOT NULL default 0,
 			updated_at datetime NOT NULL default CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 			PRIMARY KEY  (journey_ref, stop_code),
 			KEY stop_code (stop_code)
@@ -365,6 +404,15 @@ class OV_Halte_Importer {
 		$realtime_column_names = wp_list_pluck($realtime_columns, 'Field');
 		if (!in_array('expected_time', $realtime_column_names, true)) {
 			$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN expected_time datetime NULL default NULL AFTER is_cancelled");
+		}
+		if (!in_array('service_date', $realtime_column_names, true)) {
+			$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN service_date date NULL default NULL AFTER expected_time");
+		}
+		if (!in_array('change_type', $realtime_column_names, true)) {
+			$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN change_type smallint(5) unsigned NOT NULL default 0 AFTER service_date");
+		}
+		if (!in_array('is_extra_train', $realtime_column_names, true)) {
+			$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN is_extra_train tinyint(1) NOT NULL default 0 AFTER change_type");
 		}
 	}
 
@@ -870,6 +918,29 @@ class OV_Halte_Importer {
 		return $result['value'];
 	}
 
+	private static function parse_expected_time_to_timestamp($expected_time) {
+		$expected_time = trim((string) $expected_time);
+		if ($expected_time === '') {
+			return false;
+		}
+
+		$timezone = wp_timezone();
+		if (!is_object($timezone)) {
+			$timezone = new DateTimeZone('UTC');
+		}
+
+		try {
+			if (preg_match('/(?:[zZ]|[+\-]\d{2}:?\d{2})$/', $expected_time)) {
+				$dt = new DateTimeImmutable($expected_time);
+			} else {
+				$dt = new DateTimeImmutable($expected_time, $timezone);
+			}
+			return $dt->getTimestamp();
+		} catch (Exception $e) {
+			return false;
+		}
+	}
+
 	private static function get_realtime_field_and_key($item, array $field_names) {
 		$result = array('key' => null, 'value' => null);
 		if (!is_array($item)) {
@@ -944,7 +1015,7 @@ class OV_Halte_Importer {
 				'journey_ref' => array('journey_ref', 'journeyRef', 'journey', 'journey_id', 'journeyId', 'trip_id', 'tripId', 'trip', 'tripRef', 'tripref', 'train_id', 'trainId', 'trainid', 'ritid', 'journeyNumber', 'journey_number', 'vehicleJourneyRef', 'serviceJourneyRef'),
 				'stop_code' => array('stop_code', 'stopCode', 'stop', 'stop_id', 'stopId', 'station_code', 'stationCode', 'halte_code', 'haltecode', 'quay_code', 'quayCode', 'user_stop_code', 'userStopCode', 'stop_point_ref', 'stopPointRef', 'stopPointCode', 'stop_point_code', 'stopplace_code', 'userStopCode', 'station', 'stationCode'),
 				'delay_seconds' => array('delay_seconds', 'delaySeconds', 'delay', 'delay_minutes', 'delayMinutes', 'delayInSeconds', 'delay_in_seconds', 'lateness', 'lateness_seconds', 'vertrekvertraging', 'vertrekVertraging', 'vertraging'),
-				'is_cancelled' => array('is_cancelled', 'isCancelled', 'cancelled', 'canceled', 'isCanceled', 'status', 'train_status', 'trip_status', 'tripStatus', 'reis_status', 'cancelReason', 'cancel_reason', 'cancellation', 'cancellationStatus', 'cancellation_reason'),
+				'is_cancelled' => array('is_cancelled', 'isCancelled', 'cancelled', 'canceled', 'isCanceled', 'cancellationStatus'),
 			);
 
 			$journey_ref_value = self::get_realtime_field_value($item, $field_candidates['journey_ref']);
@@ -1007,12 +1078,12 @@ class OV_Halte_Importer {
 						$timestamp = (int) round($timestamp / 1000);
 					}
 					if ($timestamp > 0) {
-						$expected_time = date('Y-m-d H:i:s', $timestamp);
+						$expected_time = (new DateTimeImmutable('@' . $timestamp))->setTimezone(wp_timezone())->format('Y-m-d H:i:s');
 					}
 				} else {
-					$ts = strtotime($raw);
+					$ts = self::parse_expected_time_to_timestamp($raw);
 					if ($ts !== false && $ts > 0) {
-						$expected_time = date('Y-m-d H:i:s', $ts);
+						$expected_time = (new DateTimeImmutable('@' . $ts))->setTimezone(wp_timezone())->format('Y-m-d H:i:s');
 					} elseif (preg_match('/^\d{2}:\d{2}(?::\d{2})?$/', $raw)) {
 						$today = date('Y-m-d');
 						$expected_time = $today . ' ' . $raw . (strlen($raw) === 5 ? ':00' : '');
@@ -1052,10 +1123,6 @@ class OV_Halte_Importer {
 				}
 			}
 
-			// If no explicit cancellation field matched, search any text field for cancel tokens.
-			if (!$is_cancelled && self::detect_cancel_in_text_recursive($item)) {
-				$is_cancelled = true;
-			}
 
 			if ($journey_ref !== '' && $stop_code !== '') {
 				$alt_journey_refs = array($journey_ref);
@@ -1066,6 +1133,7 @@ class OV_Halte_Importer {
 						$alt_journey_refs[] = $last_part;
 					}
 				}
+
 
 				$alt_stop_codes = array($stop_code);
 				if (preg_match('/^NL:Q:(\d+)$/i', $stop_code, $m)) {
@@ -1123,6 +1191,26 @@ class OV_Halte_Importer {
 		return 0;
 	}
 
+	private static function extract_base_train_number($train_num) {
+		$train_num = trim((string) $train_num);
+		if (strlen($train_num) === 6 && ctype_digit($train_num)) {
+			$val = (int) $train_num;
+			$rest = null;
+			if (($val >= 100000 && $val <= 399999) || ($val >= 700000 && $val <= 749999)) {
+				$rest = substr($train_num, 1);
+			} elseif ($val >= 690000 && $val <= 699999) {
+				$rest = substr($train_num, 2);
+			}
+			if ($rest !== null) {
+				$base = ltrim($rest, '0');
+				if ($base !== '') {
+					return $base;
+				}
+			}
+		}
+		return null;
+	}
+
 	private static function normalize_boolean_value($value) {
 		if (is_bool($value)) {
 			return $value;
@@ -1138,42 +1226,12 @@ class OV_Halte_Importer {
 				return false;
 			}
 
-			$truthy_values = array('1', 'true', 'yes', 'y', 'ja', 'oui');
-			if (in_array($value, $truthy_values, true)) {
-				return true;
-			}
-
-			$cancel_tokens = array(
-				'cancelled',
-				'canceled',
-				'vervallen',
-				'geannuleerd',
-				'annulering',
-				'rijdt niet',
-				'rijdtniet',
-				'rijdetniet',
-				'niet gereden',
-				'nietgereden',
-				'nietopgevoerd',
-				'notdriving',
-				'deleted',
-				'cancel',
-			);
-			// Use word-boundary regex matching so tokens inside other words/numbers
-			// do not accidentally trigger a cancellation.
-			foreach ($cancel_tokens as $token) {
-				$pattern = '/\b' . preg_quote($token, '/') . '\b/i';
-				if (preg_match($pattern, $value) === 1) {
-					return true;
-				}
-			}
-
-			return false;
+			$truthy_values = array('1', 'true', 'yes', 'y', 'ja', 'oui', 'cancelled', 'canceled', 'vervallen', 'geannuleerd', 'rijdetniet', 'deleted');
+			return in_array($value, $truthy_values, true);
 		}
 
 		return false;
 	}
-
 
 	/**
 	 * Detect cancellation tokens in free-form text without treating numeric
@@ -1186,16 +1244,9 @@ class OV_Halte_Importer {
 			return false;
 		}
 		$value = strtolower(trim($text));
-		$cancel_tokens = array('cancelled','canceled','vervallen','geannuleerd','annulering','rijdt niet','rijdtniet','rijdetniet','niet gereden','nietgereden','nietopgevoerd','notdriving','deleted','cancel');
-		foreach ($cancel_tokens as $token) {
-			$pattern = '/\b' . preg_quote($token, '/') . '\b/i';
-			if (preg_match($pattern, $value) === 1) {
-				return true;
-			}
-		}
-		return false;
+		$cancel_tokens = array('cancelled', 'canceled', 'vervallen', 'geannuleerd', 'rijdetniet', 'deleted');
+		return in_array($value, $cancel_tokens, true);
 	}
-
 
 	private static function detect_cancel_in_text_recursive($item) {
 		if (is_string($item)) {
@@ -1264,6 +1315,170 @@ class OV_Halte_Importer {
 			return 0;
 		}
 
+		// Suppress upstream cancellations: for each journey_ref try to determine
+		// the stop-order from the timetable and clear is_cancelled on any
+		// upstream stops that precede the earliest cancelled stop for that journey.
+		$journey_indices = array();
+		foreach ($rows as $i => $r) {
+			$jr = isset($r['journey_ref']) ? $r['journey_ref'] : '';
+			if ($jr === '') {
+				continue;
+			}
+			if (!isset($journey_indices[$jr])) {
+				$journey_indices[$jr] = array();
+			}
+			$journey_indices[$jr][] = $i;
+		}
+
+		foreach ($journey_indices as $journey_ref => $indices) {
+			// Determine a reliable timetable mapping by trying candidate journey_refs
+			// (including short variants) and selecting the pattern with the best
+			// coverage of the stop_codes present in these rows. This avoids
+			// trusting a poor match that would cause upstream cancellations to be
+			// incorrectly cleared (or preserved).
+			$so_table = self::table('stop_offsets');
+			$st_table = self::table('scheduled_stops');
+			$ass_table = self::table('assignments');
+
+			// collect unique stop codes for these indices
+			$unique_stop_codes = array();
+			foreach ($indices as $idx) {
+				$code = isset($rows[$idx]['stop_code']) ? (string) $rows[$idx]['stop_code'] : '';
+				if ($code !== '') {
+					$unique_stop_codes[$code] = true;
+				}
+			}
+			$unique_stop_codes = array_keys($unique_stop_codes);
+			if (empty($unique_stop_codes)) {
+				continue;
+			}
+
+			// build candidate list: explicit variants plus the raw journey_ref
+			$candidates = array_unique(array_merge(array($journey_ref), self::get_realtime_journey_ref_variants($journey_ref)));
+
+			$best = null;
+			$best_coverage = 0;
+			$best_stop_rows = array();
+			$best_pattern_ref = '';
+			$best_time_ref = '';
+			// Load normalization settings (feature-flag, thresholds) — can be configured via WP option or JSON file
+			$norm_settings = self::get_cancel_normalization_settings();
+			if (empty($norm_settings) || empty($norm_settings['enabled'])) {
+				// normalization disabled globally
+				continue;
+			}
+			$coverage_threshold_ratio = isset($norm_settings['coverage_threshold']) ? (float) $norm_settings['coverage_threshold'] : 0.5;
+			$merge_tolerance_seconds = isset($norm_settings['merge_tolerance_seconds']) ? (int) $norm_settings['merge_tolerance_seconds'] : 120;
+
+			foreach ($candidates as $cand) {
+				if ($cand === '') {
+					continue;
+				}
+				$journey_row = $wpdb->get_row($wpdb->prepare('SELECT service_journey_pattern_ref, time_demand_type_ref FROM ' . self::table('journeys') . ' WHERE journey_ref = %s LIMIT 1', $cand), ARRAY_A);
+				if (empty($journey_row) || empty($journey_row['service_journey_pattern_ref']) || empty($journey_row['time_demand_type_ref'])) {
+					continue;
+				}
+				$pattern_ref = $journey_row['service_journey_pattern_ref'];
+				$time_ref = $journey_row['time_demand_type_ref'];
+
+				$query = "SELECT so.stop_order, st.user_stop_code, ass.quay_code FROM {$so_table} so LEFT JOIN {$st_table} st ON st.scheduled_stop_point_ref = so.scheduled_stop_point_ref LEFT JOIN {$ass_table} ass ON ass.scheduled_stop_point_ref = so.scheduled_stop_point_ref WHERE so.service_journey_pattern_ref = %s AND so.time_demand_type_ref = %s";
+				$stop_rows = $wpdb->get_results($wpdb->prepare($query, $pattern_ref, $time_ref), ARRAY_A);
+				if (empty($stop_rows)) {
+					continue;
+				}
+
+				// build temporary map and compute coverage
+				$stop_order_map_tmp = array();
+				foreach ($stop_rows as $sr) {
+					$o = isset($sr['stop_order']) ? (int) $sr['stop_order'] : null;
+					if ($o === null) continue;
+					if (!empty($sr['user_stop_code'])) $stop_order_map_tmp[(string) $sr['user_stop_code']] = $o;
+					if (!empty($sr['quay_code'])) {
+						$stop_order_map_tmp[(string) $sr['quay_code']] = $o;
+						if (preg_match('/^NL:Q:(\d+)$/i', $sr['quay_code'], $m)) {
+							$stop_order_map_tmp[$m[1]] = $o;
+						}
+					}
+				}
+
+				$coverage = 0;
+				foreach ($unique_stop_codes as $usc) {
+					if (isset($stop_order_map_tmp[$usc])) $coverage++;
+				}
+
+				if ($coverage > $best_coverage) {
+					$best_coverage = $coverage;
+					$best = $cand;
+					$best_stop_rows = $stop_rows;
+					$best_pattern_ref = $pattern_ref;
+					$best_time_ref = $time_ref;
+				}
+			}
+
+			// require sufficient coverage before using this mapping
+			if ($best === null || $best_coverage < 1 || ($best_coverage / max(1, count($unique_stop_codes))) < $coverage_threshold_ratio) {
+				// No reliable mapping found — skip normalization for this journey_ref
+				continue;
+			}
+
+			// Build stop_order_map from best_stop_rows
+			$stop_order_map = array();
+			foreach ($best_stop_rows as $sr) {
+				$o = isset($sr['stop_order']) ? (int) $sr['stop_order'] : null;
+				if ($o === null) continue;
+				if (!empty($sr['user_stop_code'])) $stop_order_map[(string) $sr['user_stop_code']] = $o;
+				if (!empty($sr['quay_code'])) {
+					$stop_order_map[(string) $sr['quay_code']] = $o;
+					if (preg_match('/^NL:Q:(\d+)$/i', $sr['quay_code'], $m)) {
+						$stop_order_map[$m[1]] = $o;
+					}
+				}
+			}
+			// Audit log: chosen mapping for this journey
+			error_log(sprintf('OVHI-NORM: journey_ref=%s chosen=%s coverage=%d/%d pattern_ref=%s time_ref=%s', $journey_ref, $best, $best_coverage, max(1, count($unique_stop_codes)), $best_pattern_ref, $best_time_ref));
+
+			// Find earliest cancelled stop order for this journey where we have a mapping
+			$earliest_cancel_order = null;
+			foreach ($indices as $idx) {
+				if (empty($rows[$idx]['is_cancelled'])) continue;
+				$code = isset($rows[$idx]['stop_code']) ? (string) $rows[$idx]['stop_code'] : '';
+				if ($code === '') continue;
+				if (isset($stop_order_map[$code])) {
+					$o = $stop_order_map[$code];
+					if ($earliest_cancel_order === null || $o < $earliest_cancel_order) $earliest_cancel_order = $o;
+				} else {
+					if (preg_match('/^NL:Q:(\d+)$/i', $code, $m) && isset($stop_order_map[$m[1]])) {
+						$o = $stop_order_map[$m[1]];
+						if ($earliest_cancel_order === null || $o < $earliest_cancel_order) $earliest_cancel_order = $o;
+					} elseif (preg_match('/^\d+$/', $code) && isset($stop_order_map['NL:Q:' . $code])) {
+						$o = $stop_order_map['NL:Q:' . $code];
+						if ($earliest_cancel_order === null || $o < $earliest_cancel_order) $earliest_cancel_order = $o;
+					}
+				}
+			}
+
+			if ($earliest_cancel_order === null) {
+				continue;
+			}
+
+			// Clear is_cancelled for any upstream stop (stop_order < earliest_cancel_order)
+			foreach ($indices as $idx) {
+				$code = isset($rows[$idx]['stop_code']) ? (string) $rows[$idx]['stop_code'] : '';
+				if ($code === '') continue;
+				$mapped_order = null;
+				if (isset($stop_order_map[$code])) {
+					$mapped_order = $stop_order_map[$code];
+				} elseif (preg_match('/^NL:Q:(\d+)$/i', $code, $m) && isset($stop_order_map[$m[1]])) {
+					$mapped_order = $stop_order_map[$m[1]];
+				} elseif (preg_match('/^\d+$/', $code) && isset($stop_order_map['NL:Q:' . $code])) {
+					$mapped_order = $stop_order_map['NL:Q:' . $code];
+				}
+				if ($mapped_order !== null && $mapped_order < $earliest_cancel_order && !empty($rows[$idx]['is_cancelled'])) {
+					$rows[$idx]['is_cancelled'] = 0;
+				}
+			}
+		}
+
 		$table = self::table('realtime_delays');
 		$chunks = array_chunk($rows, 250);
 
@@ -1271,15 +1486,16 @@ class OV_Halte_Importer {
 			$values = array();
 			$queries = array();
 			foreach ($chunk as $row) {
-				// Do not persist expected_time (unreliable). Store only journey_ref, stop_code, delay_seconds and is_cancelled.
-				$queries[] = "(%s, %s, %d, %d, NOW())";
+				// expected_time may be an empty string; use NULLIF in the VALUES list
+				$queries[] = "(%s, %s, %d, %d, NULLIF(%s, ''), NOW())";
 				$values[] = isset($row['journey_ref']) ? $row['journey_ref'] : '';
 				$values[] = isset($row['stop_code']) ? $row['stop_code'] : '';
 				$values[] = isset($row['delay_seconds']) ? (int) $row['delay_seconds'] : 0;
 				$values[] = isset($row['is_cancelled']) ? (int) $row['is_cancelled'] : 0;
+				$values[] = isset($row['expected_time']) ? $row['expected_time'] : '';
 			}
 
-			$sql = 'INSERT INTO ' . $table . ' (journey_ref, stop_code, delay_seconds, is_cancelled, updated_at) VALUES ' . implode(', ', $queries) . ' ON DUPLICATE KEY UPDATE delay_seconds = VALUES(delay_seconds), is_cancelled = VALUES(is_cancelled), updated_at = NOW()';
+			$sql = 'INSERT INTO ' . $table . ' (journey_ref, stop_code, delay_seconds, is_cancelled, expected_time, updated_at) VALUES ' . implode(', ', $queries) . ' ON DUPLICATE KEY UPDATE delay_seconds = VALUES(delay_seconds), is_cancelled = VALUES(is_cancelled), expected_time = VALUES(expected_time), updated_at = NOW()';
 			$result = $wpdb->query($wpdb->prepare($sql, $values));
 
 			if ($result === false) {
@@ -1372,6 +1588,8 @@ class OV_Halte_Importer {
 				$query = '
 					SELECT DISTINCT
 						j.journey_ref,
+						j.departure_seconds AS journey_departure_seconds,
+						so.offset_seconds AS stop_offset_seconds,
 						st.user_stop_code,
 						COALESCE(NULLIF(j.journey_number, \'\'), SUBSTRING_INDEX(SUBSTRING_INDEX(SUBSTRING_INDEX(j.journey_ref, CHAR(58), -1), CHAR(45), -2), CHAR(45), 1)) AS journey_number
 					FROM ' . self::table('journeys') . ' j
@@ -1396,6 +1614,39 @@ class OV_Halte_Importer {
 					error_log('OVHI: matching-query raakte de LIMIT van ' . $max_rows_per_query . ' rijen voor dit segment; sommige matches kunnen ontbreken. Overweeg de matching te verfijnen (bv. op vervoerder) als dit vaak voorkomt.');
 				}
 
+				/*
+				 * Eenzelfde journey_number + stop_code combinatie kan op één dag meerdere
+				 * keren voorkomen (bijv. een rondje heen-en-terug dat op hetzelfde station
+				 * begint en eindigt, of een ritnummer dat later op de dag hergebruikt wordt
+				 * voor een andere, ongerelateerde rit). Zonder disambiguatie schreef de code
+				 * hieronder de binnenkomende vertraging naar ALLE matchende journey_refs
+				 * tegelijk. Als de live rit inmiddels bijna voltooid is en verderop een grote
+				 * vertraging heeft opgelopen, kwam die vertraging zo ten onrechte ook op het
+				 * eerste station van een heel andere (bijv. nog niet begonnen) rit met
+				 * hetzelfde ritnummer terecht. Daarom kiezen we per journey_number+stop_code
+				 * alleen de match waarvan de geplande tijd op dat station het dichtst bij het
+				 * gerapporteerde tijdstip (expected_time) — of anders het huidige moment —
+				 * ligt, en negeren we kandidaten die te ver weg liggen om aannemelijk dezelfde
+				 * rit te zijn.
+				 *
+				 * Deze vergelijking gebeurt bewust puur op kloktijd (seconden-sinds-
+				 * middernacht), NIET via DateTimeImmutable/wp_timezone() omgerekend naar
+				 * absolute epoch-tijd. expected_time wordt door de daemon als lokale,
+				 * naive 'Y-m-d H:i:s' weggeschreven, en departure_seconds/offset_seconds
+				 * zijn óók altijd lokale kloktijd-seconden (nooit epoch). Zodra je één kant
+				 * via wp_timezone() naar epoch omrekent, hangt de uitkomst af van de
+				 * WordPress-tijdzone-instelling en kan een verkeerd geconfigureerde of
+				 * dubbelzinnige tijdzone twee kandidaten die in werkelijkheid ~2 uur uit
+				 * elkaar liggen precies verwisselen. Door in kloktijd-seconden te
+				 * vergelijken (zoals de rest van deze codebase dat al voor
+				 * departure_seconds/offset_seconds doet) is de vergelijking volledig
+				 * onafhankelijk van de sitetijdzone.
+				 */
+				$max_plausible_diff_seconds = 6 * HOUR_IN_SECONDS;
+				$window = self::current_operational_window();
+				$service_date = $window['start_date'];
+
+				$best_match_per_key = array();
 				foreach ($matches as $match) {
 					$journey_number = isset($match['journey_number']) ? (string) $match['journey_number'] : '';
 					$stop_code = isset($match['user_stop_code']) ? (string) $match['user_stop_code'] : '';
@@ -1403,6 +1654,50 @@ class OV_Halte_Importer {
 					if ($journey_number === '' || $stop_code === '' || empty($match['journey_ref']) || !isset($rows_by_key[$key])) {
 						continue;
 					}
+
+					// Bepaal het referentietijdstip in kloktijd-seconden-sinds-middernacht
+					// van de OV-dag (dus >= 5*3600 als het na middernacht maar vóór 05:00 is).
+					$reference_seconds = null;
+					$source_expected_time = isset($rows_by_key[$key]['expected_time']) ? trim((string) $rows_by_key[$key]['expected_time']) : '';
+					if ($source_expected_time !== '' && preg_match('/(\d{2}):(\d{2}):(\d{2})$/', $source_expected_time, $tm)) {
+						$reference_seconds = ((int) $tm[1]) * 3600 + ((int) $tm[2]) * 60 + (int) $tm[3];
+					}
+					if ($reference_seconds === null) {
+						$now_wall = current_time('mysql');
+						if (preg_match('/(\d{2}):(\d{2}):(\d{2})$/', $now_wall, $tm)) {
+							$reference_seconds = ((int) $tm[1]) * 3600 + ((int) $tm[2]) * 60 + (int) $tm[3];
+						} else {
+							$reference_seconds = 0;
+						}
+					}
+					if ($reference_seconds < 5 * HOUR_IN_SECONDS) {
+						$reference_seconds += DAY_IN_SECONDS;
+					}
+
+					$total_seconds = (int) (isset($match['journey_departure_seconds']) ? $match['journey_departure_seconds'] : 0)
+						+ (int) (isset($match['stop_offset_seconds']) ? $match['stop_offset_seconds'] : 0);
+					$total_seconds_norm = $total_seconds;
+					if ($total_seconds_norm < 5 * HOUR_IN_SECONDS) {
+						$total_seconds_norm += DAY_IN_SECONDS;
+					}
+
+					$diff = abs($total_seconds_norm - $reference_seconds);
+
+					if (!isset($best_match_per_key[$key]) || $diff < $best_match_per_key[$key]['diff']) {
+						$best_match_per_key[$key] = array('match' => $match, 'diff' => $diff);
+					}
+				}
+
+				foreach ($best_match_per_key as $key => $best) {
+					if ($best['diff'] > $max_plausible_diff_seconds) {
+						// Geen enkele kandidaat ligt binnen een aannemelijke tijdspanne van het
+						// gerapporteerde tijdstip; sla deze journey_number+stop_code over in
+						// plaats van te gokken op de verkeerde rit.
+						continue;
+					}
+
+					$match = $best['match'];
+					$stop_code = isset($match['user_stop_code']) ? (string) $match['user_stop_code'] : '';
 
 					$source = $rows_by_key[$key];
 					$source['journey_ref'] = (string) $match['journey_ref'];
@@ -1441,36 +1736,11 @@ class OV_Halte_Importer {
 		}
 
 		$variants = array($journey_ref);
-		// If the journey_ref is namespaced (e.g. NL:...:longref), include the short last part
 		if (strpos($journey_ref, ':') !== false) {
 			$parts = explode(':', $journey_ref);
 			$short_ref = trim((string) end($parts));
 			if ($short_ref !== '' && $short_ref !== $journey_ref) {
 				$variants[] = $short_ref;
-			}
-		}
-
-		// If the ref contains only digits, include variants without leading zeros
-		if (preg_match('/^\d+$/', $journey_ref)) {
-			$no_leading = ltrim($journey_ref, '0');
-			if ($no_leading !== '' && $no_leading !== $journey_ref) {
-				$variants[] = $no_leading;
-			}
-			// Special-case: NS sometimes prefixes cancelled or special journey numbers with '300' (e.g. 3003617)
-			// Include a variant with the '300' prefix stripped so that matching still works
-			if (preg_match('/^300(\d{3,})$/', $journey_ref, $m)) {
-				$variants[] = $m[1];
-			}
-		}
-
-		// Also, if the short_ref (from namespaced ref) is numeric, apply the same numeric rules
-		if (isset($short_ref) && preg_match('/^\d+$/', $short_ref)) {
-			$no_leading = ltrim($short_ref, '0');
-			if ($no_leading !== '' && $no_leading !== $short_ref) {
-				$variants[] = $no_leading;
-			}
-			if (preg_match('/^300(\d{3,})$/', $short_ref, $m2)) {
-				$variants[] = $m2[1];
 			}
 		}
 
@@ -2292,36 +2562,9 @@ class OV_Halte_Importer {
 
 		$placeholders_j = implode(',', array_fill(0, count($journey_ref_variants), '%s'));
 		$placeholders_s = implode(',', array_fill(0, count($lookup_stop_codes), '%s'));
-		// Prefer an exact match on both journey_ref and stop_code. Order by the
-		// preferred journey_ref variants first, then by the preferred stop_code
-		// variants so the query returns the most relevant realtime row for the
-		// specific stop. Fall back to any variant if an exact match is not
-		// available.
-		$query = 'SELECT journey_ref, stop_code, delay_seconds, is_cancelled FROM ' . $table . ' WHERE journey_ref IN (' . $placeholders_j . ') AND stop_code IN (' . $placeholders_s . ') ORDER BY FIELD(journey_ref, ' . $placeholders_j . '), FIELD(stop_code, ' . $placeholders_s . ') LIMIT 1';
-		// Parameters: journey variants, stop variants, then repeated for the two FIELD() ordering calls
-		$params = array_merge($journey_ref_variants, $lookup_stop_codes, $journey_ref_variants, $lookup_stop_codes);
+		$query = 'SELECT journey_ref, delay_seconds, is_cancelled FROM ' . $table . ' WHERE journey_ref IN (' . $placeholders_j . ') AND stop_code IN (' . $placeholders_s . ') ORDER BY FIELD(journey_ref, ' . $placeholders_j . ') LIMIT 1';
+		$params = array_merge($journey_ref_variants, $lookup_stop_codes, $journey_ref_variants);
 		$row = $wpdb->get_row($wpdb->prepare($query, $params), ARRAY_A);
-
-		// Ensure the matched realtime row actually applies to the queried stop.
-		// If the stored row's stop_code does not match any of the lookup stop_code
-		// variants for this query, ignore the row entirely to avoid showing
-		// "Rijdt niet" at a stop where the cancellation applies elsewhere on
-		// the route.
-		if (!empty($row)) {
-			$stored_stop = isset($row['stop_code']) ? (string) $row['stop_code'] : '';
-			$stored_variants = self::get_realtime_stop_code_variants($stored_stop);
-			$match_found = false;
-			foreach ($stored_variants as $sv) {
-			    if (in_array($sv, $lookup_stop_codes, true)) {
-			        $match_found = true;
-			        break;
-			    }
-			}
-			if (!$match_found) {
-			    // Treat as no row found for this particular stop
-			    $row = null;
-			}
-		}
 
 		$res = array(
 			'delay_seconds' => (!empty($row) && isset($row['delay_seconds'])) ? (int) $row['delay_seconds'] : 0,
@@ -3768,13 +4011,20 @@ private static function parse_assignment(XMLReader $reader) {
 			$destination = !empty($item['destination']) ? $item['destination'] : (isset($item['line_name']) ? $item['line_name'] : '');
 			$departure_text = !empty($item['departures']) ? ': ' . implode(' - ', $item['departures']) : '';
 			$schedule_url = !empty($item['schedule_url']) ? $item['schedule_url'] : '';
+			$destination_html = wp_kses($destination, array(
+				'span'   => array('class' => array(), 'style' => array()),
+				'strong' => array(),
+				'em'     => array(),
+				's'      => array('style' => array()),
+				'br'     => array(),
+			));
 			?>
 			<div class="ovhi-item">
 				<a class="ovhi-badge" href="<?php echo esc_url($schedule_url); ?>" style="background-color: <?php echo esc_attr($background); ?>; color: <?php echo esc_attr($text_color); ?>;">
 					<?php echo esc_html($item['public_code']); ?>
 				</a>
 				<span class="ovhi-content">
-					<a class="ovhi-destination" href="<?php echo esc_url($schedule_url); ?>"><?php echo esc_html($destination) . $departure_text; ?></a>
+					<a class="ovhi-destination" href="<?php echo esc_url($schedule_url); ?>"><?php echo $destination_html . $departure_text; ?></a>
 				</span>
 			</div>
 			<?php
@@ -4100,6 +4350,14 @@ private static function parse_assignment(XMLReader $reader) {
 		foreach ($groups as $total_seconds => $group) {
 			if (count($group) > 1) {
 				usort($group, function ($a, $b) {
+					// Kies bij meerdere dienstregelingsvarianten eerst de variant waarvoor
+					// daadwerkelijk actuele informatie is gevonden. Anders kan een nieuwere
+					// kalenderregel de live vertraging van de juiste rit wegdrukken.
+					$a_has_realtime = !empty($a['delay_seconds']) || !empty($a['is_cancelled']) || !empty($a['expected_time']);
+					$b_has_realtime = !empty($b['delay_seconds']) || !empty($b['is_cancelled']) || !empty($b['expected_time']);
+					if ($a_has_realtime !== $b_has_realtime) {
+						return $a_has_realtime ? -1 : 1;
+					}
 					return strcmp($b['from_date'], $a['from_date']);
 				});
 			}
@@ -4121,14 +4379,32 @@ private static function parse_assignment(XMLReader $reader) {
 				$realtime_candidate = $planned_candidate->modify(($offset >= 0 ? '+' : '-') . abs($offset) . ' seconds');
 			}
 
+			// De verwachte tijd uit de livebron is leidend voor selectie en sortering.
+			// Voorheen werd deze alleen in de tekst getoond; een bus kon daardoor
+			// verdwijnen zodra de geplande tijd voorbij was, ondanks een nog komende
+			// actuele vertrektijd. Beperk de correctie tot een plausibele rit rondom
+			// de geplande tijd, zodat een fout gekoppelde live-rit niet wordt getoond.
+			$expected_timestamp = isset($row['expected_time']) ? self::parse_expected_time_to_timestamp($row['expected_time']) : false;
+			if ($expected_timestamp !== false && abs($expected_timestamp - $planned_candidate->getTimestamp()) <= 12 * HOUR_IN_SECONDS) {
+				$realtime_candidate = (new DateTimeImmutable('@' . $expected_timestamp))->setTimezone($window['timezone']);
+			}
+
 			// Blijf zichtbaar tot de geplande tijd is verstreken (bij voorloop) of tot de
-			// vertraagde tijd is verstreken (bij vertraging): gebruik steeds de laatste van de twee.
-			$visibility_candidate = $realtime_candidate > $planned_candidate ? $realtime_candidate : $planned_candidate;
+			// vertraagde tijd is verstreken (bij vertraging). Bij uitval ("rijdt niet")
+			// mag de rit 5 minuten na de geplande vertrektijd van het bord verdwijnen.
+			if (!empty($row['is_cancelled'])) {
+				$visibility_candidate = $planned_candidate->modify('+300 seconds');
+			} else {
+				$visibility_candidate = $realtime_candidate > $planned_candidate ? $realtime_candidate : $planned_candidate;
+			}
 
 			if ($visibility_candidate > $window['now'] && $realtime_candidate >= $window['start'] && $realtime_candidate < $window['end']) {
 				$planned_time_str = $planned_candidate->format('H:i');
 				$formatted = self::format_time_with_delay($planned_time_str, $row['delay_seconds'], $row['is_cancelled'], isset($row['expected_time']) ? $row['expected_time'] : '');
-				$candidates[$realtime_candidate->getTimestamp()] = $formatted;
+				$candidates[] = array(
+					'timestamp' => $realtime_candidate->getTimestamp(),
+					'formatted' => $formatted,
+				);
 			}
 		}
 
@@ -4136,8 +4412,12 @@ private static function parse_assignment(XMLReader $reader) {
 			return array();
 		}
 
-		ksort($candidates, SORT_NUMERIC);
-		return array_slice(array_values($candidates), 0, $limit);
+		// Bewaar ook twee ritten met exact dezelfde actuele tijd; een associatieve
+		// array op timestamp overschreef er voorheen één.
+		usort($candidates, function ($a, $b) {
+			return $a['timestamp'] <=> $b['timestamp'];
+		});
+		return array_slice(array_column($candidates, 'formatted'), 0, $limit);
 	}
 
 	private static function format_time_with_delay($time_str, $delay_seconds = 0, $is_cancelled = false, $expected_time = '') {
@@ -4145,39 +4425,22 @@ private static function parse_assignment(XMLReader $reader) {
 		if ($is_cancelled) {
 			return '<span style="color:#d00;font-weight:700;">Rijdt niet</span>';
 		}
-		// prefer explicit expected_time from realtime if provided
-		if (!empty($expected_time)) {
-			try {
-				// Interpret stored expected_time as UTC (no tz info) and convert to
-				// the site timezone for display. This avoids mismatches when the
-				// daemon writes a naive datetime in server-local time.
-				$site_tz = function_exists('wp_timezone') ? wp_timezone() : new DateTimeZone(date_default_timezone_get());
-				$utc = new DateTimeZone('UTC');
-				// First try strict Y-m-d H:i:s format as UTC
-				$dt = DateTime::createFromFormat('Y-m-d H:i:s', $expected_time, $utc);
-				if ($dt instanceof DateTime) {
-					$dt->setTimezone($site_tz);
-					return $dt->format('H:i');
-				}
-				// Fallback: attempt to parse with DateTime assuming UTC
-				$dt2 = new DateTime($expected_time, $utc);
-				if ($dt2 instanceof DateTime) {
-					$dt2->setTimezone($site_tz);
-					return $dt2->format('H:i');
-				}
-			} catch (Throwable $e) {
-				// parsing failed — ignore and fall back to delay display
+		$delay_seconds = (int) $delay_seconds;
+		if ($delay_seconds !== 0) {
+			$sign = $delay_seconds > 0 ? '+' : '-';
+			$minutes = (int) floor((abs($delay_seconds) + 59) / 60);
+			if ($minutes > 0) {
+				$color = $delay_seconds > 0 ? '#d00' : '#0a0';
+				return $time_html . ' <span style="color:' . esc_attr($color) . ';font-weight:700;">' . esc_html($sign . $minutes) . '</span>';
 			}
 		}
-
-		if (empty($delay_seconds)) {
-			return $time_html;
+		if (!empty($expected_time)) {
+			$ts = self::parse_expected_time_to_timestamp($expected_time);
+			if ($ts !== false) {
+				return (new DateTimeImmutable('@' . $ts))->setTimezone(wp_timezone())->format('H:i');
+			}
 		}
-
-		$sign = (int) $delay_seconds > 0 ? '+' : '-';
-		$minutes = (int) floor((abs((int) $delay_seconds) + 59) / 60);
-		$color = (int) $delay_seconds > 0 ? '#d00' : '#0a0';
-		return $time_html . ' <span style="color:' . esc_attr($color) . ';font-weight:700;">' . esc_html($sign . $minutes) . '</span>';
+		return $time_html;
 	}
 
 	private static function availability_matches_date(array $availability, $service_date) {
