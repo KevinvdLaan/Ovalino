@@ -1074,9 +1074,14 @@ class Ovalino_Map {
 			// another reused train number/stop and must not leak into this popup.
 			$expected_ts = !empty($expected_time) ? self::parse_expected_time_to_timestamp($expected_time) : 0;
 			$reported_ts = $ts + (int) $delay_seconds;
-			if ($expected_ts > 0 && abs($expected_ts - $reported_ts) > 30 * MINUTE_IN_SECONDS) {
+			if ($expected_ts > 0 && abs($expected_ts - $reported_ts) > 5 * MINUTE_IN_SECONDS) {
+				// Dit is geen vertraging voor deze geplande stop (meestal een hergebruikt
+				// treinnummer of een update van het eindstation). Negeer de volledige
+				// livewaarde; alleen de verwachte tijd verbergen liet de verkeerde +N staan.
 				$expected_time = null;
 				$expected_ts = 0;
+				$delay_seconds = 0;
+				$is_cancelled = false;
 			}
 			$visibility_ts = $expected_ts > 0 ? $expected_ts + MINUTE_IN_SECONDS : self::calculate_visibility_cutoff($ts, $delay_seconds);
 

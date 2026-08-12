@@ -3287,7 +3287,7 @@ class OV_Trein_Dienstregeling {
 			$s_placeholders = implode(',', array_fill(0, count($st_codes), '%s'));
 			$one_hour_ago = gmdate('Y-m-d H:i:s', time() - HOUR_IN_SECONDS);
 			$params = array_merge($lookup_journey_refs, $st_codes, array($one_hour_ago));
-			$query = "SELECT journey_ref, stop_code, delay_seconds, is_cancelled, expected_time FROM $realtime_table WHERE journey_ref IN ($j_placeholders) AND stop_code IN ($s_placeholders) AND updated_at >= %s";
+			$query = "SELECT journey_ref, stop_code, delay_seconds, is_cancelled, expected_time, service_date FROM $realtime_table WHERE journey_ref IN ($j_placeholders) AND stop_code IN ($s_placeholders) AND updated_at >= %s";
 			$rows = $wpdb->get_results($wpdb->prepare($query, ...$params), ARRAY_A);
 			if (!empty($rows)) {
 				/*
@@ -3337,23 +3337,28 @@ class OV_Trein_Dienstregeling {
 					}
 				}
 
-				$max_plausible_diff_seconds = 4 * HOUR_IN_SECONDS;
 				$service_tz = wp_timezone();
+				// InfoPlus levert per station zowel de actuele tijd als de vertraging.
+				// Alleen als actuele tijd - vertraging vrijwel gelijk is aan de geplande
+				// tijd van exact die stop, mag een ritnummermatch worden gebruikt.
+				// Dit voorkomt dat een update voor het eindstation bij een eerdere stop
+				// terechtkomt wanneer een treinnummer binnen de servicedag wordt hergebruikt.
+				$scheduled_match_tolerance_seconds = 5 * MINUTE_IN_SECONDS;
 
 				foreach ($rows as $r) {
+					if ($service_date !== '' && !empty($r['service_date']) && (string) $r['service_date'] !== (string) $service_date) {
+						continue;
+					}
 					$stop_code_lower = strtolower($r['stop_code']);
 					$matched_refs = isset($scheduled_refs_by_lookup[$r['journey_ref']]) ? $scheduled_refs_by_lookup[$r['journey_ref']] : array($r['journey_ref']);
 
-					$reference_ts = null;
+					$expected_ts = null;
 					if (!empty($r['expected_time'])) {
 						try {
-							$reference_ts = (new DateTimeImmutable((string) $r['expected_time'], $service_tz))->getTimestamp();
+							$expected_ts = (new DateTimeImmutable((string) $r['expected_time'], $service_tz))->getTimestamp();
 						} catch (Exception $e) {
-							$reference_ts = null;
+							$expected_ts = null;
 						}
-					}
-					if ($reference_ts === null) {
-						$reference_ts = time();
 					}
 
 					foreach ($matched_refs as $matched_ref) {
@@ -3362,17 +3367,21 @@ class OV_Trein_Dienstregeling {
 							try {
 								$scheduled_dt = new DateTimeImmutable($service_date . ' 00:00:00', $service_tz);
 								$scheduled_dt = $scheduled_dt->modify('+' . $stop_scheduled_seconds[$sched_key] . ' seconds');
-								$diff = abs($scheduled_dt->getTimestamp() - $reference_ts);
-								if ($diff > $max_plausible_diff_seconds) {
-									// This scheduled_ref's own stop is scheduled much too far
-									// from the reported time to plausibly be the same update;
-									// skip it rather than showing a mismatched delay here.
+								if ($expected_ts !== null) {
+									$reported_planned_ts = $expected_ts - (int) $r['delay_seconds'];
+									if (abs($scheduled_dt->getTimestamp() - $reported_planned_ts) > $scheduled_match_tolerance_seconds) {
+										continue;
+									}
+								} elseif ((string) $r['journey_ref'] !== (string) $matched_ref) {
+									// Zonder een actuele tijd kunnen we een los treinnummer niet veilig
+									// aan één van meerdere dienstregelingsritten koppelen.
 									continue;
 								}
 							} catch (Exception $e) {
-								// If we can't compute a scheduled time, fall back to the
-								// old exact-match behaviour for this candidate.
+								continue;
 							}
+						} elseif ((string) $r['journey_ref'] !== (string) $matched_ref) {
+							continue;
 						}
 						$delays[$matched_ref . '|' . $stop_code_lower] = $r;
 					}
