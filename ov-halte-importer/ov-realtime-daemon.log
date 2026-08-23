@@ -1,0 +1,13 @@
+[Daemon Marker] PID=8452 logging started to Y:\New project\ov-halte-importer\ov-realtime-daemon.log
+2026-08-23 17:55:18,588 [DEBUG] Logging initialized, chosen_path=Y:\New project\ov-halte-importer\ov-realtime-daemon.log
+2026-08-23 17:55:18,728 [INFO] [PASS] Test 1: RitInfo correctly assigns delay only to Utrecht, not Den Helder.
+2026-08-23 17:55:18,730 [ERROR] Traceback (most recent call last):
+2026-08-23 17:55:18,732 [ERROR]   File "C:\Users\kvand\.gemini\antigravity\brain\0dee351a-0f94-4db4-8c0e-cb764de0e91d\scratch\test_delay_parsing.py", line 91, in <module>
+    subscriber.process_dvs(ET.fromstring(dvs_xml))
+                           ^^
+2026-08-23 17:55:18,734 [ERROR] NameError: name 'ET' is not defined
+[Daemon Marker] PID=8184 logging started to Y:\New project\ov-halte-importer\ov-realtime-daemon.log
+2026-08-23 17:55:23,785 [DEBUG] Logging initialized, chosen_path=Y:\New project\ov-halte-importer\ov-realtime-daemon.log
+2026-08-23 17:55:23,895 [INFO] [PASS] Test 1: RitInfo correctly assigns delay only to Utrecht, not Den Helder.
+2026-08-23 17:55:24,038 [INFO] [PASS] Test 2: DVS never corrupts TreinOorsprong (Den Helder), updates only RitStation (Utrecht).
+2026-08-23 17:55:24,041 [INFO] ALL TESTS PASSED!

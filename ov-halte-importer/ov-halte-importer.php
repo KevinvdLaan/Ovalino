@@ -1,8 +1,8 @@
 <?php
 /**
- * Plugin Name: OV Halte Importer
+ * Plugin Name: Ovalino OV Halte Importer
  * Description: Upload CHB-, PassengerStopAssignment- en NeTEx-bestanden en toon automatisch lijnen en bestemmingen per halte via shortcode.
- * Version: 1.3.9
+ * Version: 1.5
  * Author: Kevin van der Laan
  * License: GPL-2.0-or-later
  */
@@ -12,7 +12,7 @@ if (!defined('ABSPATH')) {
 }
 
 class OV_Halte_Importer {
-	const VERSION = '1.3.9';
+	const VERSION = '1.5';
 	const OPTION_IMPORT_INFO = 'ovhi_import_info';
 	const OPTION_LIVE_DELAY_SETTINGS = 'ovhi_live_delay_settings';
 	const OPTION_LIVE_DELAY_LAST_SYNC = 'ovhi_live_delay_last_sync';
@@ -25,8 +25,6 @@ class OV_Halte_Importer {
 	private static $runtime_table_prefix = '';
 
 	public static function init() {
-		// dbDelta/ALTER statements are idempotent; run migrations after plugin updates too.
-		self::migrate_tables();
 		register_activation_hook(__FILE__, array(__CLASS__, 'activate'));
 		add_action('admin_menu', array(__CLASS__, 'admin_menu'));
 		add_action('admin_post_ovhi_upload', array(__CLASS__, 'handle_upload'));
@@ -232,8 +230,10 @@ class OV_Halte_Importer {
 			line_name varchar(255) NOT NULL default '',
 			colour varchar(7) NOT NULL default '',
 			text_colour varchar(7) NOT NULL default '',
+			transport_mode varchar(20) NOT NULL default 'bus',
 			PRIMARY KEY  (line_ref),
-			KEY public_code (public_code)
+			KEY public_code (public_code),
+			KEY transport_mode (transport_mode)
 		) $charset;";
 
 		$sql[] = "CREATE TABLE " . self::table('stop_lines') . " (
@@ -314,12 +314,13 @@ class OV_Halte_Importer {
 			delay_seconds int(11) NOT NULL default 0,
 			is_cancelled tinyint(1) NOT NULL default 0,
 			expected_time datetime NULL default NULL,
-			service_date date NULL default NULL,
-			change_type smallint(5) unsigned NOT NULL default 0,
+			service_date varchar(10) NULL default NULL,
+			change_type int(11) NOT NULL default 0,
 			is_extra_train tinyint(1) NOT NULL default 0,
 			updated_at datetime NOT NULL default CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 			PRIMARY KEY  (journey_ref, stop_code),
-			KEY stop_code (stop_code)
+			KEY stop_code (stop_code),
+			KEY service_date (service_date)
 		) $charset;";
 		
 		$sql[] = "CREATE TABLE " . self::table('notices') . " (
@@ -398,7 +399,21 @@ class OV_Halte_Importer {
 			$wpdb->query("ALTER TABLE $table_journeys ADD INDEX journey_number (journey_number)");
 		}
 
-		// Migrate realtime_delays table: add expected_time column if missing
+		// Migrate lines table: add transport_mode, gevuld uit het NeTEx <TransportMode>
+		// veld op Line-niveau (bv. "bus" of "water"). Dit maakt het mogelijk om
+		// bus- en bootdiensten (bv. Ovalino Boot / WPD-veerdiensten) uit dezelfde
+		// gedeelde dataset te filteren. Ontbreekt het veld in de bron (zoals bij
+		// de meeste bestaande busexports), dan valt dit terug op 'bus' zodat het
+		// bestaande gedrag van OV Lijn Dienstregeling ongewijzigd blijft.
+		$table_lines = self::table('lines');
+		$lines_columns = $wpdb->get_results("DESCRIBE $table_lines");
+		$lines_column_names = wp_list_pluck($lines_columns, 'Field');
+		if (!in_array('transport_mode', $lines_column_names, true)) {
+			$wpdb->query("ALTER TABLE $table_lines ADD COLUMN transport_mode varchar(20) NOT NULL default 'bus' AFTER text_colour");
+			$wpdb->query("ALTER TABLE $table_lines ADD INDEX transport_mode (transport_mode)");
+		}
+
+		// Migrate realtime_delays table: add expected_time, service_date, change_type, is_extra_train columns if missing
 		$table_realtime = self::table('realtime_delays');
 		$realtime_columns = $wpdb->get_results("DESCRIBE $table_realtime");
 		$realtime_column_names = wp_list_pluck($realtime_columns, 'Field');
@@ -406,10 +421,11 @@ class OV_Halte_Importer {
 			$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN expected_time datetime NULL default NULL AFTER is_cancelled");
 		}
 		if (!in_array('service_date', $realtime_column_names, true)) {
-			$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN service_date date NULL default NULL AFTER expected_time");
+			$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN service_date varchar(10) NULL default NULL AFTER expected_time");
+			$wpdb->query("ALTER TABLE $table_realtime ADD INDEX service_date (service_date)");
 		}
 		if (!in_array('change_type', $realtime_column_names, true)) {
-			$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN change_type smallint(5) unsigned NOT NULL default 0 AFTER service_date");
+			$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN change_type int(11) NOT NULL default 0 AFTER service_date");
 		}
 		if (!in_array('is_extra_train', $realtime_column_names, true)) {
 			$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN is_extra_train tinyint(1) NOT NULL default 0 AFTER change_type");
@@ -514,6 +530,14 @@ class OV_Halte_Importer {
 						<tr>
 							<td><strong>Lijnen</strong></td>
 							<td><?php echo isset($info['counts']['lines']) ? esc_html((string) $info['counts']['lines']) : '0'; ?></td>
+						</tr>
+						<tr>
+							<td>&nbsp;&nbsp;<strong>waarvan bus</strong></td>
+							<td><?php echo isset($info['counts']['bus_lines']) ? esc_html((string) $info['counts']['bus_lines']) : '0'; ?></td>
+						</tr>
+						<tr>
+							<td>&nbsp;&nbsp;<strong>waarvan boot</strong> <span title="TransportMode = water">🚤</span></td>
+							<td><?php echo isset($info['counts']['boat_lines']) ? esc_html((string) $info['counts']['boat_lines']) : '0'; ?></td>
 						</tr>
 						<tr>
 							<td><strong>Halte-lijn combinaties</strong></td>
@@ -686,6 +710,10 @@ class OV_Halte_Importer {
 			<code>[ov_halte stopplace="NL:S:10006870" departures_url="https://voorbeeld.nl/vertrektijden"]</code>
 			<p>Optioneel: link naar de treindienstregeling (plugin OV Trein Dienstregeling):</p>
 			<code>[ov_halte station="gn" train_schedule_url="https://voorbeeld.nl/treindienstregeling/"]</code>
+			<p>Voor een havenhalte (bijv. Lauwersoog) worden veerdiensten automatisch herkend via TransportMode=water en apart getoond als "Eerstvolgende geplande boten", met een badge "Veer" en een link naar de Ovalino Boot-dienstregeling (plugin Ovalino Boot):</p>
+			<code>[ov_halte stopplace="NL:S:10380001"]</code>
+			<p>Optioneel: eigen basis-URL voor die link naar de veerdienstregeling (standaard <code>/veerdienstregeling/</code>):</p>
+			<code>[ov_halte stopplace="NL:S:10380001" boat_schedule_url="https://voorbeeld.nl/veerdienstregeling/"]</code>
 		</div>
 		<?php
 	}
@@ -771,6 +799,8 @@ class OV_Halte_Importer {
 				'stopplaces' => 0,
 				'quays' => 0,
 				'lines' => 0,
+				'bus_lines' => 0,
+				'boat_lines' => 0,
 				'stop_lines' => 0,
 				'stop_line_patterns' => 0,
 				'journeys' => 0,
@@ -782,6 +812,8 @@ class OV_Halte_Importer {
 			$required_quays = self::get_assigned_quay_codes();
 			$counts = array_merge($counts, self::import_chb($saved_files['chb'], $required_quays));
 			$counts['lines'] = $netex_counts['lines'];
+			$counts['bus_lines'] = $netex_counts['bus_lines'];
+			$counts['boat_lines'] = $netex_counts['boat_lines'];
 			$counts['stop_lines'] = $netex_counts['stop_lines'];
 			$counts['stop_line_patterns'] = $netex_counts['stop_line_patterns'];
 			$counts['journeys'] = $netex_counts['journeys'];
@@ -1507,12 +1539,40 @@ class OV_Halte_Importer {
 		return count($rows);
 	}
 
+	/**
+	 * Splitst een korte, live-API-achtige journey_ref (bv. "EBS:1025") in
+	 * vervoerdercode + ritnummer. Ritnummers zijn alleen uniek per
+	 * vervoerder+lijn, niet vervoerder-breed - vandaar dat we hier de
+	 * vervoerdercode apart teruggeven, zodat de matching hieronder daarop
+	 * kan filteren i.p.v. alle lijnen van alle vervoerders te doorzoeken.
+	 *
+	 * @return array{0:string,1:string} array($operator, $journey_number) - beide
+	 *         kunnen leeg zijn als ze niet uit de ref zijn te halen.
+	 */
+	private static function split_realtime_operator_and_number($journey_ref) {
+		$journey_ref = trim((string) $journey_ref);
+		if ($journey_ref === '') {
+			return array('', '');
+		}
+		if (strpos($journey_ref, ':') === false) {
+			// Kale vorm zonder vervoerdercode: kan niet veilig op lijn worden
+			// gefilterd, dus geen operator teruggeven (wordt hieronder overgeslagen).
+			return array('', $journey_ref);
+		}
+		$parts = explode(':', $journey_ref);
+		$number = trim((string) end($parts));
+		$operator = trim((string) $parts[0]);
+		return array($operator, $number);
+	}
+
 	private static function add_scheduled_journey_delay_entries(array $rows) {
 		global $wpdb;
 
+		$operators = array();
 		$journey_numbers = array();
 		$stop_codes = array();
 		$rows_by_key = array();
+		$skipped_no_operator = 0;
 
 		foreach ($rows as $row) {
 			$journey_ref = isset($row['journey_ref']) ? trim((string) $row['journey_ref']) : '';
@@ -1521,32 +1581,46 @@ class OV_Halte_Importer {
 				continue;
 			}
 
-			$journey_number = self::get_realtime_journey_number($journey_ref);
+			list($operator, $journey_number) = self::split_realtime_operator_and_number($journey_ref);
 			if ($journey_number === '') {
 				continue;
 			}
+			if ($operator === '') {
+				// Zonder vervoerdercode kunnen we niet veilig op lijn filteren
+				// (ritnummers zijn niet vervoerder-breed uniek) - liever geen
+				// verrijkte match dan een verkeerde lijn koppelen.
+				$skipped_no_operator++;
+				continue;
+			}
+
+			$operators[$operator] = true;
 			$journey_numbers[$journey_number] = true;
 
 			foreach (self::get_realtime_stop_code_variants($stop_code) as $variant) {
 				$stop_codes[$variant] = true;
-				$rows_by_key[$journey_number . "\0" . $variant] = $row;
+				$rows_by_key[$operator . "\0" . $journey_number . "\0" . $variant] = $row;
 			}
 		}
 
-		if (empty($journey_numbers) || empty($stop_codes)) {
+		if ($skipped_no_operator > 0) {
+			error_log('OVHI: ' . $skipped_no_operator . ' live-vertraging(en) overgeslagen voor lijnmatching wegens ontbrekende vervoerdercode in journey_ref.');
+		}
+
+		if (empty($operators) || empty($journey_numbers) || empty($stop_codes)) {
 			return $rows;
 		}
 
+		$operators = array_keys($operators);
 		$journey_numbers = array_keys($journey_numbers);
 		$stop_codes = array_keys($stop_codes);
 
 		/*
 		 * Veiligheidsgrenzen: voorkom dat één synchronisatieronde onbegrensd
 		 * geheugen kan opeisen, ongeacht hoe groot de binnenkomende live-feed
-		 * is of hoeveel dienstregelingsregels er (per ongeluk, door hergebruikte
-		 * journey-nummers tussen vervoerders) matchen. Zonder deze grenzen kan
-		 * de JOIN hieronder een combinatorische explosie van rijen opleveren
-		 * en PHP's memory_limit fataal doen vastlopen (zie OVHI-incident 23/07).
+		 * is of hoeveel dienstregelingsregels er matchen. Zonder deze grenzen
+		 * kan de JOIN hieronder een combinatorische explosie van rijen
+		 * opleveren en PHP's memory_limit fataal doen vastlopen (zie
+		 * OVHI-incident 23/07).
 		 */
 		$max_journey_chunk_size = 100;
 		$max_stop_chunk_size = 200;
@@ -1555,6 +1629,7 @@ class OV_Halte_Importer {
 
 		$journey_chunks = array_chunk($journey_numbers, $max_journey_chunk_size);
 		$stop_chunks = array_chunk($stop_codes, $max_stop_chunk_size);
+		$operator_placeholders = implode(',', array_fill(0, count($operators), '%s'));
 
 		$total_matches = 0;
 
@@ -1569,29 +1644,31 @@ class OV_Halte_Importer {
 				$stop_placeholders = implode(',', array_fill(0, count($stop_chunk), '%s'));
 
 				/*
-				 * Matcht bij voorkeur op het echte journey_number (uit het
-				 * NeTEx <PrivateCode type="JourneyNumber">-veld op
-				 * ServiceJourney-niveau - hetzelfde veld als "JourneyNumber"
-				 * in de live KV78turbo-feed). Dit werkt voor elke vervoerder,
-				 * ongeacht hoe die zijn ServiceJourney-id/journey_ref opbouwt.
+				 * Matcht op het echte journey_number (uit het NeTEx
+				 * <PrivateCode type="JourneyNumber">-veld op ServiceJourney-
+				 * niveau - hetzelfde veld als "JourneyNumber" in de live
+				 * KV78turbo-feed) EN op de vervoerdercode die als 2e segment
+				 * in stop_offsets.line_ref staat (bv. "NL:EBS:Line:4509" ->
+				 * "EBS"). Ritnummers zijn alleen uniek per vervoerder+lijn,
+				 * dus zonder deze vervoerdersfilter matchte een journey_number
+				 * eerder ook rijen van compleet andere lijnen/vervoerders die
+				 * toevallig hetzelfde nummer gebruiken en langs dezelfde
+				 * (drukke) halte komen - dat gaf ten onrechte "rijdt niet" op
+				 * lijnen die gewoon reden.
 				 *
-				 * Voor rijen die (nog) geen journey_number hebben - bv. data
-				 * die is geïmporteerd vóór deze wijziging, of een exporteur
-				 * die dit veld niet vult - valt de query terug op de oude
-				 * heuristiek die de laatste twee streepjes-delen uit het
-				 * journey_ref/id haalt. Die heuristiek klopt toevallig voor
-				 * Qbuzz's ID-opbouw (...:<blok>-<ritnr>-<variant>) maar niet
-				 * per se voor andere vervoerders (zoals EBS: ...:<lijn>-
-				 * <blok>-<ritnr>, waar de heuristiek "<blok>" ipv "<ritnr>"
-				 * teruggaf) - vandaar dat Qbuzz altijd al matchte en EBS niet.
+				 * Voor rijen die (nog) geen journey_number hebben valt de
+				 * query terug op de oude heuristiek die de laatste twee
+				 * streepjes-delen uit het journey_ref/id haalt (klopt
+				 * toevallig voor Qbuzz's ID-opbouw ...:<blok>-<ritnr>-<variant>,
+				 * niet per se voor andere vervoerders) - de vervoerdersfilter
+				 * blijft in dat geval wel gelden.
 				 */
 				$query = '
 					SELECT DISTINCT
 						j.journey_ref,
-						j.departure_seconds AS journey_departure_seconds,
-						so.offset_seconds AS stop_offset_seconds,
 						st.user_stop_code,
-						COALESCE(NULLIF(j.journey_number, \'\'), SUBSTRING_INDEX(SUBSTRING_INDEX(SUBSTRING_INDEX(j.journey_ref, CHAR(58), -1), CHAR(45), -2), CHAR(45), 1)) AS journey_number
+						COALESCE(NULLIF(j.journey_number, \'\'), SUBSTRING_INDEX(SUBSTRING_INDEX(SUBSTRING_INDEX(j.journey_ref, CHAR(58), -1), CHAR(45), -2), CHAR(45), 1)) AS journey_number,
+						SUBSTRING_INDEX(SUBSTRING_INDEX(so.line_ref, CHAR(58), 2), CHAR(58), -1) AS operator
 					FROM ' . self::table('journeys') . ' j
 					INNER JOIN ' . self::table('stop_offsets') . ' so
 						ON so.service_journey_pattern_ref = j.service_journey_pattern_ref
@@ -1600,9 +1677,10 @@ class OV_Halte_Importer {
 						ON st.scheduled_stop_point_ref = so.scheduled_stop_point_ref
 					WHERE COALESCE(NULLIF(j.journey_number, \'\'), SUBSTRING_INDEX(SUBSTRING_INDEX(SUBSTRING_INDEX(j.journey_ref, CHAR(58), -1), CHAR(45), -2), CHAR(45), 1)) IN (' . $journey_placeholders . ')
 						AND st.user_stop_code IN (' . $stop_placeholders . ')
+						AND SUBSTRING_INDEX(SUBSTRING_INDEX(so.line_ref, CHAR(58), 2), CHAR(58), -1) IN (' . $operator_placeholders . ')
 					LIMIT ' . (int) $max_rows_per_query;
 
-				$params = array_merge($journey_chunk, $stop_chunk);
+				$params = array_merge($journey_chunk, $stop_chunk, $operators);
 				$matches = $wpdb->get_results($wpdb->prepare($query, $params), ARRAY_A);
 
 				if ($matches === null) {
@@ -1611,93 +1689,17 @@ class OV_Halte_Importer {
 				}
 
 				if (count($matches) >= $max_rows_per_query) {
-					error_log('OVHI: matching-query raakte de LIMIT van ' . $max_rows_per_query . ' rijen voor dit segment; sommige matches kunnen ontbreken. Overweeg de matching te verfijnen (bv. op vervoerder) als dit vaak voorkomt.');
+					error_log('OVHI: matching-query raakte de LIMIT van ' . $max_rows_per_query . ' rijen voor dit segment; sommige matches kunnen ontbreken. Overweeg de matching verder te verfijnen als dit vaak voorkomt.');
 				}
 
-				/*
-				 * Eenzelfde journey_number + stop_code combinatie kan op één dag meerdere
-				 * keren voorkomen (bijv. een rondje heen-en-terug dat op hetzelfde station
-				 * begint en eindigt, of een ritnummer dat later op de dag hergebruikt wordt
-				 * voor een andere, ongerelateerde rit). Zonder disambiguatie schreef de code
-				 * hieronder de binnenkomende vertraging naar ALLE matchende journey_refs
-				 * tegelijk. Als de live rit inmiddels bijna voltooid is en verderop een grote
-				 * vertraging heeft opgelopen, kwam die vertraging zo ten onrechte ook op het
-				 * eerste station van een heel andere (bijv. nog niet begonnen) rit met
-				 * hetzelfde ritnummer terecht. Daarom kiezen we per journey_number+stop_code
-				 * alleen de match waarvan de geplande tijd op dat station het dichtst bij het
-				 * gerapporteerde tijdstip (expected_time) — of anders het huidige moment —
-				 * ligt, en negeren we kandidaten die te ver weg liggen om aannemelijk dezelfde
-				 * rit te zijn.
-				 *
-				 * Deze vergelijking gebeurt bewust puur op kloktijd (seconden-sinds-
-				 * middernacht), NIET via DateTimeImmutable/wp_timezone() omgerekend naar
-				 * absolute epoch-tijd. expected_time wordt door de daemon als lokale,
-				 * naive 'Y-m-d H:i:s' weggeschreven, en departure_seconds/offset_seconds
-				 * zijn óók altijd lokale kloktijd-seconden (nooit epoch). Zodra je één kant
-				 * via wp_timezone() naar epoch omrekent, hangt de uitkomst af van de
-				 * WordPress-tijdzone-instelling en kan een verkeerd geconfigureerde of
-				 * dubbelzinnige tijdzone twee kandidaten die in werkelijkheid ~2 uur uit
-				 * elkaar liggen precies verwisselen. Door in kloktijd-seconden te
-				 * vergelijken (zoals de rest van deze codebase dat al voor
-				 * departure_seconds/offset_seconds doet) is de vergelijking volledig
-				 * onafhankelijk van de sitetijdzone.
-				 */
-				$max_plausible_diff_seconds = 6 * HOUR_IN_SECONDS;
-				$window = self::current_operational_window();
-				$service_date = $window['start_date'];
-
-				$best_match_per_key = array();
 				foreach ($matches as $match) {
 					$journey_number = isset($match['journey_number']) ? (string) $match['journey_number'] : '';
+					$operator = isset($match['operator']) ? (string) $match['operator'] : '';
 					$stop_code = isset($match['user_stop_code']) ? (string) $match['user_stop_code'] : '';
-					$key = $journey_number . "\0" . $stop_code;
-					if ($journey_number === '' || $stop_code === '' || empty($match['journey_ref']) || !isset($rows_by_key[$key])) {
+					$key = $operator . "\0" . $journey_number . "\0" . $stop_code;
+					if ($journey_number === '' || $operator === '' || $stop_code === '' || empty($match['journey_ref']) || !isset($rows_by_key[$key])) {
 						continue;
 					}
-
-					// Bepaal het referentietijdstip in kloktijd-seconden-sinds-middernacht
-					// van de OV-dag (dus >= 5*3600 als het na middernacht maar vóór 05:00 is).
-					$reference_seconds = null;
-					$source_expected_time = isset($rows_by_key[$key]['expected_time']) ? trim((string) $rows_by_key[$key]['expected_time']) : '';
-					if ($source_expected_time !== '' && preg_match('/(\d{2}):(\d{2}):(\d{2})$/', $source_expected_time, $tm)) {
-						$reference_seconds = ((int) $tm[1]) * 3600 + ((int) $tm[2]) * 60 + (int) $tm[3];
-					}
-					if ($reference_seconds === null) {
-						$now_wall = current_time('mysql');
-						if (preg_match('/(\d{2}):(\d{2}):(\d{2})$/', $now_wall, $tm)) {
-							$reference_seconds = ((int) $tm[1]) * 3600 + ((int) $tm[2]) * 60 + (int) $tm[3];
-						} else {
-							$reference_seconds = 0;
-						}
-					}
-					if ($reference_seconds < 5 * HOUR_IN_SECONDS) {
-						$reference_seconds += DAY_IN_SECONDS;
-					}
-
-					$total_seconds = (int) (isset($match['journey_departure_seconds']) ? $match['journey_departure_seconds'] : 0)
-						+ (int) (isset($match['stop_offset_seconds']) ? $match['stop_offset_seconds'] : 0);
-					$total_seconds_norm = $total_seconds;
-					if ($total_seconds_norm < 5 * HOUR_IN_SECONDS) {
-						$total_seconds_norm += DAY_IN_SECONDS;
-					}
-
-					$diff = abs($total_seconds_norm - $reference_seconds);
-
-					if (!isset($best_match_per_key[$key]) || $diff < $best_match_per_key[$key]['diff']) {
-						$best_match_per_key[$key] = array('match' => $match, 'diff' => $diff);
-					}
-				}
-
-				foreach ($best_match_per_key as $key => $best) {
-					if ($best['diff'] > $max_plausible_diff_seconds) {
-						// Geen enkele kandidaat ligt binnen een aannemelijke tijdspanne van het
-						// gerapporteerde tijdstip; sla deze journey_number+stop_code over in
-						// plaats van te gokken op de verkeerde rit.
-						continue;
-					}
-
-					$match = $best['match'];
-					$stop_code = isset($match['user_stop_code']) ? (string) $match['user_stop_code'] : '';
 
 					$source = $rows_by_key[$key];
 					$source['journey_ref'] = (string) $match['journey_ref'];
@@ -1729,12 +1731,88 @@ class OV_Halte_Importer {
 		return trim((string) end($parts));
 	}
 
+	/**
+	 * Bepaalt vervoerder + LinePlanningNumber + ritnummer voor een dienstregeling-
+	 * journey_ref, door de bijbehorende lijn op te zoeken via stop_offsets.line_ref.
+	 *
+	 * BELANGRIJK (gecorrigeerd n.a.v. controle tegen de EBS/Qbuzz NeTEx-bronbestanden):
+	 * we vergelijken hier met het NeTEx-veld <PrivateCode type="LinePlanningNumber">
+	 * van de Line (bv. "4247" voor EBS, "b510" voor Qbuzz) - NIET met <PublicCode>
+	 * (bv. "247"/"510"). Dat zijn twee verschillende velden/waarden. LinePlanningNumber
+	 * is exact hetzelfde veld (zelfde naam, zelfde bron) als "LinePlanningNumber" in de
+	 * live KV78turbo-feed, en staat bovendien letterlijk als leidend segment in de
+	 * ServiceJourney-id zelf (bv. "NL:EBS:ServiceJourney:4247-86873-17840682" en
+	 * "NL:QBUZZ:ServiceJourney:b510-20-401-333935"). We halen het daarom simpelweg uit
+	 * het laatste segment van line_ref ("NL:EBS:Line:4247" -> "4247"), zonder de lines-
+	 * tabel erbij te hoeven halen.
+	 *
+	 * Ritnummers zijn alleen uniek per vervoerder+lijn, niet vervoerder-breed. Zonder
+	 * deze context kan een realtime-vertraging/uitval van lijn A per ongeluk aan lijn B
+	 * worden gekoppeld zodra beide hetzelfde ritnummer gebruiken en langs dezelfde
+	 * (drukke) halte komen.
+	 *
+	 * @return array{operator:string,line_planning_number:string,journey_number:string}|null
+	 */
+	private static function get_realtime_journey_context($journey_ref) {
+		static $cache = array();
+
+		$journey_ref = trim((string) $journey_ref);
+		if ($journey_ref === '') {
+			return null;
+		}
+		if (array_key_exists($journey_ref, $cache)) {
+			return $cache[$journey_ref];
+		}
+
+		global $wpdb;
+		$query = '
+			SELECT j.journey_number, so.line_ref
+			FROM ' . self::table('journeys') . ' j
+			INNER JOIN ' . self::table('stop_offsets') . ' so
+				ON so.service_journey_pattern_ref = j.service_journey_pattern_ref
+				AND so.time_demand_type_ref = j.time_demand_type_ref
+			WHERE j.journey_ref = %s AND j.journey_number != \'\' AND so.line_ref != \'\'
+			LIMIT 1';
+		$row = $wpdb->get_row($wpdb->prepare($query, $journey_ref), ARRAY_A);
+
+		$context = null;
+		if (!empty($row) && !empty($row['journey_number']) && !empty($row['line_ref'])) {
+			$line_parts = explode(':', (string) $row['line_ref']);
+			$operator = isset($line_parts[1]) ? $line_parts[1] : '';
+			$line_planning_number = trim((string) end($line_parts));
+			if ($operator !== '' && $line_planning_number !== '') {
+				$context = array(
+					'operator' => $operator,
+					'line_planning_number' => $line_planning_number,
+					'journey_number' => (string) $row['journey_number'],
+				);
+			}
+		}
+
+		$cache[$journey_ref] = $context;
+		return $context;
+	}
+
 	private static function get_realtime_journey_ref_variants($journey_ref) {
 		$journey_ref = trim((string) $journey_ref);
 		if ($journey_ref === '') {
 			return array();
 		}
 
+		// Lijn-gekwalificeerde sleutel: "<OPERATOR>:<LINEPLANNINGNUMBER>:<RITNUMMER>".
+		// Zodra we deze context kunnen bepalen, matchen we UITSLUITEND hierop (plus de
+		// letterlijke, altijd-exacte journey_ref zelf) - bewust geen fallback meer naar
+		// het kale/ambigue ritnummer, want dat was precies de bron van foutieve
+		// matches tussen lijnen die toevallig hetzelfde ritnummer gebruiken.
+		$context = self::get_realtime_journey_context($journey_ref);
+		if ($context !== null) {
+			$composite = $context['operator'] . ':' . $context['line_planning_number'] . ':' . $context['journey_number'];
+			return array_values(array_unique(array($composite, $journey_ref)));
+		}
+
+		// Geen lijncontext te bepalen (bv. journey_ref niet in de dienstregeling
+		// gevonden) - val terug op de oude, minder betrouwbare heuristiek zodat er
+		// tenminste nog een kans op een match is.
 		$variants = array($journey_ref);
 		if (strpos($journey_ref, ':') !== false) {
 			$parts = explode(':', $journey_ref);
@@ -1744,7 +1822,7 @@ class OV_Halte_Importer {
 			}
 		}
 
-		return array_values(array_unique($variants));
+		return array_values(array_unique(array_filter($variants, 'strlen')));
 	}
 
 	private static function get_realtime_stop_code_variants($stop_code) {
@@ -2487,6 +2565,17 @@ class OV_Halte_Importer {
 		$query = 'SELECT journey_ref, stop_code, delay_seconds, is_cancelled, expected_time FROM ' . $table . ' WHERE journey_ref IN (' . $placeholders_j . ') AND stop_code IN (' . $placeholders_s . ')';
 		$rows = $wpdb->get_results($wpdb->prepare($query, $params), ARRAY_A);
 
+		// Verwerk lijn-gekwalificeerde treffers ("OPERATOR:LIJN:RITNUMMER", 2 dubbele
+		// punten) eerst. De onderstaande loop vult de map "eerste treffer wint", dus
+		// door de meest specifieke (lijn-gekwalificeerde) rijen als eerste te verwerken
+		// claimen die de mapping vóórdat een minder betrouwbare treffer op alleen het
+		// (ambigue) ritnummer dat kan doen.
+		usort($rows, function ($a, $b) {
+			$a_specificity = substr_count((string) $a['journey_ref'], ':');
+			$b_specificity = substr_count((string) $b['journey_ref'], ':');
+			return $b_specificity <=> $a_specificity;
+		});
+
 		$map = array();
 		foreach ((array) $rows as $row) {
 			$delay = array(
@@ -2664,6 +2753,8 @@ private static function parse_assignment(XMLReader $reader) {
 		$counts = array(
 			'quays' => 0,
 			'lines' => 0,
+			'bus_lines' => 0,
+			'boat_lines' => 0,
 			'stop_lines' => 0,
 			'stop_line_patterns' => 0,
 			'journeys' => 0,
@@ -2699,6 +2790,7 @@ private static function parse_assignment(XMLReader $reader) {
 		$assignments = array();
 		$destination_displays = array();
 		$route_to_line = array();
+		$route_to_direction = array();
 		$stop_lines = array();
 		$stop_line_patterns = array();
 		$patterns = array();
@@ -2762,6 +2854,9 @@ private static function parse_assignment(XMLReader $reader) {
 						if (!empty($route['route_ref']) && !empty($route['line_ref'])) {
 							$route_to_line[$route['route_ref']] = $route['line_ref'];
 						}
+						if (!empty($route['route_ref']) && !empty($route['direction_type'])) {
+							$route_to_direction[$route['route_ref']] = $route['direction_type'];
+						}
 						break;
 
 					case 'AvailabilityCondition':
@@ -2806,6 +2901,20 @@ private static function parse_assignment(XMLReader $reader) {
 			}
 
 			$reader->close();
+
+		// Sommige NeTEx-bronnen (o.a. de WPD-veerdiensten) zetten <DirectionType>
+		// alleen op de Route, niet op de ServiceJourneyPattern zelf. Vul dat hier
+		// aan vanuit $route_to_direction, nu de volledige eerste pass voltooid is
+		// en dus alle Route-elementen sowieso al zijn ingelezen (ongeacht de
+		// volgorde waarin Route/ServiceJourneyPattern in het bestand voorkomen).
+		// Zonder deze fallback blijft direction_type leeg, matcht geen enkele
+		// 'inbound'/'outbound'-filter, en zijn er dus nooit ritten of datums
+		// selecteerbaar voor die lijn.
+		foreach ($patterns as $pattern_ref => $pattern_row) {
+			if (empty($pattern_row['direction_type']) && !empty($pattern_row['route_ref']) && !empty($route_to_direction[$pattern_row['route_ref']])) {
+				$patterns[$pattern_ref]['direction_type'] = $route_to_direction[$pattern_row['route_ref']];
+			}
+		}
 
 		$assigned_quays = array();
 		$assignment_rows = $wpdb->get_results('SELECT scheduled_stop_point_ref, quay_code FROM ' . self::table('assignments'), ARRAY_A);
@@ -2992,6 +3101,13 @@ private static function parse_assignment(XMLReader $reader) {
 
 		$count_quays = count($quays);
 		$count_lines = count($lines);
+		$count_boat_lines = 0;
+		foreach ($lines as $line_row) {
+			if (isset($line_row['transport_mode']) && $line_row['transport_mode'] === 'water') {
+				$count_boat_lines++;
+			}
+		}
+		$count_bus_lines = $count_lines - $count_boat_lines;
 		$count_stop_lines = count($stop_lines);
 		$count_stop_line_patterns = count($stop_line_patterns);
 		$count_notices = count($notices);
@@ -3004,7 +3120,7 @@ private static function parse_assignment(XMLReader $reader) {
 
 		self::bulk_upsert(
 			'lines',
-			array('line_ref', 'public_code', 'line_name', 'colour', 'text_colour'),
+			array('line_ref', 'public_code', 'line_name', 'colour', 'text_colour', 'transport_mode'),
 			array_values($lines)
 		);
 		unset($lines);
@@ -3092,6 +3208,8 @@ private static function parse_assignment(XMLReader $reader) {
 		return array(
 			'quays' => $count_quays,
 			'lines' => $count_lines,
+			'bus_lines' => $count_bus_lines,
+			'boat_lines' => $count_boat_lines,
 			'stop_lines' => $count_stop_lines,
 			'stop_line_patterns' => $count_stop_line_patterns,
 			'journeys' => $journey_count,
@@ -3109,6 +3227,7 @@ private static function parse_assignment(XMLReader $reader) {
 			'line_name' => '',
 			'colour' => '',
 			'text_colour' => '',
+			'transport_mode' => '',
 		);
 		$in_presentation = false;
 
@@ -3135,11 +3254,20 @@ private static function parse_assignment(XMLReader $reader) {
 				$data['line_name'] = trim($reader->readString());
 			} elseif ($reader->localName === 'PublicCode' && $data['public_code'] === '') {
 				$data['public_code'] = trim($reader->readString());
+			} elseif ($reader->localName === 'TransportMode' && $data['transport_mode'] === '') {
+				// Bepaalt de schifting tussen bus- en bootdiensten (o.a. voor
+				// Ovalino Boot). NeTEx-bronnen die dit veld niet meeleveren
+				// (de meeste busvervoerders) vallen terug op 'bus'.
+				$data['transport_mode'] = strtolower(trim($reader->readString()));
 			} elseif ($in_presentation && $reader->localName === 'Colour') {
 				$data['colour'] = self::sanitize_hex($reader->readString());
 			} elseif ($in_presentation && $reader->localName === 'TextColour') {
 				$data['text_colour'] = self::sanitize_hex($reader->readString());
 			}
+		}
+
+		if ($data['transport_mode'] === '') {
+			$data['transport_mode'] = 'bus';
 		}
 
 		return $data;
@@ -3258,6 +3386,7 @@ private static function parse_assignment(XMLReader $reader) {
 		$data = array(
 			'route_ref' => (string) $reader->getAttribute('id'),
 			'line_ref' => '',
+			'direction_type' => '',
 		);
 
 		while ($reader->read()) {
@@ -3267,6 +3396,12 @@ private static function parse_assignment(XMLReader $reader) {
 
 			if ($reader->nodeType === XMLReader::ELEMENT && $reader->localName === 'LineRef') {
 				$data['line_ref'] = trim((string) $reader->getAttribute('ref'));
+			} elseif ($reader->nodeType === XMLReader::ELEMENT && $reader->localName === 'DirectionType') {
+				// Sommige NeTEx-bronnen (o.a. de WPD-veerdiensten) zetten
+				// <DirectionType> op de Route in plaats van op de
+				// ServiceJourneyPattern. Dit vangen we hier op als fallback,
+				// zodat inbound/outbound alsnog correct bepaald wordt.
+				$data['direction_type'] = trim($reader->readString());
 			}
 		}
 
@@ -3796,6 +3931,7 @@ private static function parse_assignment(XMLReader $reader) {
 				'departures_url' => '',
 				'schedule_url' => '',
 				'train_schedule_url' => '',
+				'boat_schedule_url' => '',
 			),
 			$atts,
 			'ov_halte'
@@ -3807,6 +3943,10 @@ private static function parse_assignment(XMLReader $reader) {
 		$train_schedule_base_url = trim((string) $atts['train_schedule_url']);
 		if ($train_schedule_base_url === '') {
 			$train_schedule_base_url = home_url('/treindienstregeling/');
+		}
+		$boat_schedule_base_url = trim((string) $atts['boat_schedule_url']);
+		if ($boat_schedule_base_url === '') {
+			$boat_schedule_base_url = home_url('/veerdienstregeling/');
 		}
 
 		$station_codes = array_merge(
@@ -3897,7 +4037,7 @@ private static function parse_assignment(XMLReader $reader) {
 		$scheduled_stop_refs = array_values(array_unique(array_filter($scheduled_stop_refs)));
 
 		$query = "
-			SELECT sl.quay_code, sl.line_ref, sl.direction_type, sl.destination, l.public_code, l.line_name, l.colour, l.text_colour
+			SELECT sl.quay_code, sl.line_ref, sl.direction_type, sl.destination, l.public_code, l.line_name, l.colour, l.text_colour, l.transport_mode
 			FROM " . self::table('stop_lines') . " sl
 			INNER JOIN " . self::table('lines') . " l ON l.line_ref = sl.line_ref
 			WHERE sl.quay_code IN ($placeholders)
@@ -3915,6 +4055,7 @@ private static function parse_assignment(XMLReader $reader) {
 					'direction_type' => $row['direction_type'],
 					'colour' => $row['colour'],
 					'text_colour' => $row['text_colour'],
+					'transport_mode' => isset($row['transport_mode']) ? $row['transport_mode'] : 'bus',
 					'destinations' => array(),
 				);
 			}
@@ -3939,11 +4080,29 @@ private static function parse_assignment(XMLReader $reader) {
 				$item['direction_type'],
 				2
 			);
-			$items[$key]['schedule_url'] = self::build_schedule_url(
-				$schedule_base_url,
-				$item['line_ref'],
-				$item['direction_type']
-			);
+			$is_boat = isset($item['transport_mode']) && $item['transport_mode'] === 'water';
+			if ($is_boat) {
+				// Bootdiensten (Ovalino Boot) tonen 'Veer' als badge in plaats van
+				// het lijnnummer, en linken naar de veerdienstregeling i.p.v. de
+				// gewone busdienstregeling. Zonder eigen lijnkleur (zoals bij de
+				// WPD-veerdiensten) valt de badge terug op dezelfde standaardkleur
+				// als Ovalino Boot.
+				$items[$key]['public_code'] = 'Veer';
+				if (empty($items[$key]['colour'])) {
+					$items[$key]['colour'] = '#861121';
+				}
+				$items[$key]['schedule_url'] = self::build_boat_schedule_url(
+					$boat_schedule_base_url,
+					$item['line_ref'],
+					$item['direction_type']
+				);
+			} else {
+				$items[$key]['schedule_url'] = self::build_schedule_url(
+					$schedule_base_url,
+					$item['line_ref'],
+					$item['direction_type']
+				);
+			}
 		}
 
 				$items = array_values($items);
@@ -3951,7 +4110,20 @@ private static function parse_assignment(XMLReader $reader) {
 			}
 		}
 
-		if (empty($train_items) && empty($items)) {
+		// Schifting tussen bus- en bootdiensten (o.a. voor Ovalino Boot),
+		// zodat ze onder een eigen kopje worden getoond in plaats van
+		// vermengd met de reguliere bussen.
+		$bus_items = array();
+		$boat_items = array();
+		foreach ($items as $item) {
+			if (isset($item['transport_mode']) && $item['transport_mode'] === 'water') {
+				$boat_items[] = $item;
+			} else {
+				$bus_items[] = $item;
+			}
+		}
+
+		if (empty($train_items) && empty($bus_items) && empty($boat_items)) {
 			return '';
 		}
 
@@ -3964,9 +4136,13 @@ private static function parse_assignment(XMLReader $reader) {
 				<div class="ovhi-heading">Eerstvolgende geplande treinen</div>
 				<?php echo self::render_departure_items($train_items); ?>
 			<?php endif; ?>
-			<?php if (!empty($items)) : ?>
+			<?php if (!empty($bus_items)) : ?>
 				<div class="ovhi-heading">Eerstvolgende geplande bussen</div>
-				<?php echo self::render_departure_items($items); ?>
+				<?php echo self::render_departure_items($bus_items); ?>
+			<?php endif; ?>
+			<?php if (!empty($boat_items)) : ?>
+				<div class="ovhi-heading">Eerstvolgende geplande boten</div>
+				<?php echo self::render_departure_items($boat_items); ?>
 			<?php endif; ?>
 			<?php if (!empty($atts['departures_url'])) : ?>
 				<p class="ovhi-link-spacer"></p>
@@ -4246,6 +4422,25 @@ private static function parse_assignment(XMLReader $reader) {
 		);
 	}
 
+	private static function build_boat_schedule_url($base_url, $line_ref, $direction_type) {
+		$base_url = trim((string) $base_url);
+		if ($base_url === '') {
+			return '';
+		}
+
+		// Zelfde opzet als build_schedule_url(), maar met de ovbo_*
+		// query-parameters die de Ovalino Boot-shortcode/-pagina verwacht.
+		$window = self::current_operational_window();
+		return add_query_arg(
+			array(
+				'ovbo_direction' => (string) $direction_type,
+				'ovbo_line' => (string) $line_ref,
+				'ovbo_variant' => $window['start_date'],
+			),
+			$base_url
+		);
+	}
+
 	private static function find_next_departures(array $scheduled_stop_refs, $line_ref, $direction_type, $limit = 2) {
 		global $wpdb;
 
@@ -4268,12 +4463,13 @@ private static function parse_assignment(XMLReader $reader) {
 		$params[] = $window['end_date'];
 
 		$query = "
-			SELECT DISTINCT so.offset_seconds, j.departure_seconds, j.journey_ref, st.user_stop_code, a.from_date, a.to_date, a.valid_day_bits
+			SELECT DISTINCT so.offset_seconds, j.departure_seconds, j.journey_ref, st.user_stop_code, ass.quay_code, a.from_date, a.to_date, a.valid_day_bits
 			FROM " . self::table('stop_offsets') . " so
 			INNER JOIN " . self::table('journeys') . " j
 				ON j.service_journey_pattern_ref = so.service_journey_pattern_ref
 				AND j.time_demand_type_ref = so.time_demand_type_ref
 			INNER JOIN " . self::table('scheduled_stops') . " st ON st.scheduled_stop_point_ref = so.scheduled_stop_point_ref
+			LEFT JOIN " . self::table('assignments') . " ass ON ass.scheduled_stop_point_ref = so.scheduled_stop_point_ref
 			INNER JOIN " . self::table('availability') . " a ON a.availability_ref = j.availability_ref
 			WHERE so.scheduled_stop_point_ref IN ($placeholders)
 				AND so.line_ref = %s
@@ -4319,6 +4515,13 @@ private static function parse_assignment(XMLReader $reader) {
 			if (!empty($row['journey_ref'])) {
 				$journey_refs[] = (string) $row['journey_ref'];
 			}
+			// De realtime-daemon schrijft zijn stop_code op basis van de quay/halte-code
+			// (ovhi_assignments.quay_code) - niet op basis van scheduled_stops.user_stop_code.
+			// Beide meesturen als kandidaat zodat de lookup hieronder matcht ongeacht welke
+			// kolom overeenkomt met wat de daemon daadwerkelijk heeft weggeschreven.
+			if (!empty($row['quay_code'])) {
+				$stop_codes[] = (string) $row['quay_code'];
+			}
 			if (!empty($row['user_stop_code'])) {
 				$stop_codes[] = (string) $row['user_stop_code'];
 			}
@@ -4329,14 +4532,28 @@ private static function parse_assignment(XMLReader $reader) {
 		$groups = array();
 		foreach ($valid_rows as $row) {
 			$journey_ref = isset($row['journey_ref']) ? (string) $row['journey_ref'] : '';
+			$quay_code = isset($row['quay_code']) ? (string) $row['quay_code'] : '';
 			$stop_code = isset($row['user_stop_code']) ? (string) $row['user_stop_code'] : '';
-			
-			$map_key = $journey_ref . '|' . $stop_code;
-			$delay = isset($delay_map[$map_key]) ? $delay_map[$map_key] : array('delay_seconds' => 0, 'is_cancelled' => false);
-			
-			if (empty($delay['delay_seconds']) && empty($delay['is_cancelled']) && preg_match('/^[0-9]+$/', $stop_code)) {
-				$alt_key = $journey_ref . '|NL:Q:' . $stop_code;
-				$delay = isset($delay_map[$alt_key]) ? $delay_map[$alt_key] : array('delay_seconds' => 0, 'is_cancelled' => false);
+
+			// Probeer eerst te matchen op quay_code (zoals ovalino-map.php doet, en zoals de
+			// realtime-daemon zijn stop_code opbouwt), val terug op user_stop_code.
+			$delay = array('delay_seconds' => 0, 'is_cancelled' => false);
+			if ($quay_code !== '') {
+				$map_key = $journey_ref . '|' . $quay_code;
+				if (isset($delay_map[$map_key])) {
+					$delay = $delay_map[$map_key];
+				} elseif (preg_match('/^[0-9]+$/', $quay_code) && isset($delay_map[$journey_ref . '|NL:Q:' . $quay_code])) {
+					$delay = $delay_map[$journey_ref . '|NL:Q:' . $quay_code];
+				}
+			}
+
+			if (empty($delay['delay_seconds']) && empty($delay['is_cancelled']) && $stop_code !== '') {
+				$map_key = $journey_ref . '|' . $stop_code;
+				if (isset($delay_map[$map_key])) {
+					$delay = $delay_map[$map_key];
+				} elseif (preg_match('/^[0-9]+$/', $stop_code) && isset($delay_map[$journey_ref . '|NL:Q:' . $stop_code])) {
+					$delay = $delay_map[$journey_ref . '|NL:Q:' . $stop_code];
+				}
 			}
 
 			$row['delay_seconds'] = (is_array($delay) && isset($delay['delay_seconds'])) ? (int) $delay['delay_seconds'] : 0;
@@ -4350,14 +4567,6 @@ private static function parse_assignment(XMLReader $reader) {
 		foreach ($groups as $total_seconds => $group) {
 			if (count($group) > 1) {
 				usort($group, function ($a, $b) {
-					// Kies bij meerdere dienstregelingsvarianten eerst de variant waarvoor
-					// daadwerkelijk actuele informatie is gevonden. Anders kan een nieuwere
-					// kalenderregel de live vertraging van de juiste rit wegdrukken.
-					$a_has_realtime = !empty($a['delay_seconds']) || !empty($a['is_cancelled']) || !empty($a['expected_time']);
-					$b_has_realtime = !empty($b['delay_seconds']) || !empty($b['is_cancelled']) || !empty($b['expected_time']);
-					if ($a_has_realtime !== $b_has_realtime) {
-						return $a_has_realtime ? -1 : 1;
-					}
 					return strcmp($b['from_date'], $a['from_date']);
 				});
 			}
@@ -4379,16 +4588,6 @@ private static function parse_assignment(XMLReader $reader) {
 				$realtime_candidate = $planned_candidate->modify(($offset >= 0 ? '+' : '-') . abs($offset) . ' seconds');
 			}
 
-			// De verwachte tijd uit de livebron is leidend voor selectie en sortering.
-			// Voorheen werd deze alleen in de tekst getoond; een bus kon daardoor
-			// verdwijnen zodra de geplande tijd voorbij was, ondanks een nog komende
-			// actuele vertrektijd. Beperk de correctie tot een plausibele rit rondom
-			// de geplande tijd, zodat een fout gekoppelde live-rit niet wordt getoond.
-			$expected_timestamp = isset($row['expected_time']) ? self::parse_expected_time_to_timestamp($row['expected_time']) : false;
-			if ($expected_timestamp !== false && abs($expected_timestamp - $planned_candidate->getTimestamp()) <= 12 * HOUR_IN_SECONDS) {
-				$realtime_candidate = (new DateTimeImmutable('@' . $expected_timestamp))->setTimezone($window['timezone']);
-			}
-
 			// Blijf zichtbaar tot de geplande tijd is verstreken (bij voorloop) of tot de
 			// vertraagde tijd is verstreken (bij vertraging). Bij uitval ("rijdt niet")
 			// mag de rit 5 minuten na de geplande vertrektijd van het bord verdwijnen.
@@ -4401,10 +4600,7 @@ private static function parse_assignment(XMLReader $reader) {
 			if ($visibility_candidate > $window['now'] && $realtime_candidate >= $window['start'] && $realtime_candidate < $window['end']) {
 				$planned_time_str = $planned_candidate->format('H:i');
 				$formatted = self::format_time_with_delay($planned_time_str, $row['delay_seconds'], $row['is_cancelled'], isset($row['expected_time']) ? $row['expected_time'] : '');
-				$candidates[] = array(
-					'timestamp' => $realtime_candidate->getTimestamp(),
-					'formatted' => $formatted,
-				);
+				$candidates[$realtime_candidate->getTimestamp()] = $formatted;
 			}
 		}
 
@@ -4412,12 +4608,8 @@ private static function parse_assignment(XMLReader $reader) {
 			return array();
 		}
 
-		// Bewaar ook twee ritten met exact dezelfde actuele tijd; een associatieve
-		// array op timestamp overschreef er voorheen één.
-		usort($candidates, function ($a, $b) {
-			return $a['timestamp'] <=> $b['timestamp'];
-		});
-		return array_slice(array_column($candidates, 'formatted'), 0, $limit);
+		ksort($candidates, SORT_NUMERIC);
+		return array_slice(array_values($candidates), 0, $limit);
 	}
 
 	private static function format_time_with_delay($time_str, $delay_seconds = 0, $is_cancelled = false, $expected_time = '') {

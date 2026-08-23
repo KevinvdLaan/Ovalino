@@ -180,15 +180,24 @@ function renderStops(stops) {
     var newMarkerStore = {};
     var toAdd = [];
     var hiddenLines = window.ovrepMapConfig.hiddenLines || [];
+    var hiddenBoatLines = window.ovrepMapConfig.hiddenBoatLines || [];
 
     stops.forEach(function(stop) {
         var hasVisibleLine = false;
         if (stop.lines && stop.lines.length > 0) {
             for (var i = 0; i < stop.lines.length; i++) {
-                var lineRef = stop.lines[i].lineRef;
-                if (hiddenLines.indexOf(lineRef) === -1) {
-                    hasVisibleLine = true;
-                    break;
+                var line = stop.lines[i];
+                var lineRef = line.lineRef;
+                if (line.transportMode === 'water' || stop.type === 'boat') {
+                    if (hiddenBoatLines.indexOf(lineRef) === -1) {
+                        hasVisibleLine = true;
+                        break;
+                    }
+                } else {
+                    if (hiddenLines.indexOf(lineRef) === -1) {
+                        hasVisibleLine = true;
+                        break;
+                    }
                 }
             }
         }
@@ -223,7 +232,7 @@ function renderStops(stops) {
 }
 
 function createSimpleMarker(stop) {
-    var symbol = stop.type === 'train' ? '🚂' : '🚌';
+    var symbol = stop.type === 'train' ? '🚂' : (stop.type === 'boat' ? '⛴️' : '🚌');
     var color = '#861121';
 
     var icon = L.divIcon({
@@ -281,7 +290,8 @@ function createPopupContent(stop) {
                 colour: line.colour,
                 textColour: line.textColour,
                 lineRef: line.lineRef || nameStr,
-                direction: line.direction || 'outbound'
+                direction: line.direction || 'outbound',
+                transportMode: line.transportMode || 'bus'
             };
         }
     });
@@ -294,7 +304,8 @@ function createPopupContent(stop) {
                 colour: '#861121', 
                 textColour: '#ffffff',
                 lineRef: dep.lineRef || nameStr,
-                direction: dep.direction || 'outbound'
+                direction: dep.direction || 'outbound',
+                transportMode: dep.transport_mode || 'bus'
             };
         }
     });
@@ -327,9 +338,13 @@ function createPopupContent(stop) {
 
             var ref = line.lineRef || line.name || '';
             var direction = line.direction || 'outbound';
-            var lineBaseUrl = config.lineScheduleUrl || (scheduleBaseUrl + 'dienstregeling/');
+            var lineBaseUrl = (line.transportMode === 'water' || stop.type === 'boat')
+                ? (config.boatScheduleUrl || (scheduleBaseUrl + 'veerdienstregeling/'))
+                : (config.lineScheduleUrl || (scheduleBaseUrl + 'dienstregeling/'));
             var sep = lineBaseUrl.indexOf('?') !== -1 ? '&' : '?';
-            var url = lineBaseUrl + sep + 'ovld_direction=' + encodeURIComponent(direction) + '&ovld_line=' + encodeURIComponent(ref) + '&ovld_variant=' + serviceDate;
+            var url = (line.transportMode === 'water' || stop.type === 'boat')
+                ? lineBaseUrl + sep + 'ovbo_direction=' + encodeURIComponent(direction) + '&ovbo_line=' + encodeURIComponent(ref) + '&ovbo_variant=' + serviceDate
+                : lineBaseUrl + sep + 'ovld_direction=' + encodeURIComponent(direction) + '&ovld_line=' + encodeURIComponent(ref) + '&ovld_variant=' + serviceDate;
 
             var finalFg = fg;
             if (fg === '#ffffff' || fg === '#fff') {
@@ -350,213 +365,57 @@ function createPopupContent(stop) {
         }).join('')
         : '';
 
-    var linesHtml = (stop.type !== 'train' && lineBadges)
+    var linesHtml = (stop.type !== 'train' && stop.type !== 'boat' && lineBadges)
         ? '<div style="margin-top:8px;font-size:12px;line-height:1.4;"><strong>Lijnen:</strong><div style="margin-top:4px;">' + lineBadges + '</div></div>'
         : '';
 
     var departuresHtml = '';
-
-    function getTimezoneOffsetMs(timeZone, date) {
-        if (typeof Intl !== 'object' || typeof Intl.DateTimeFormat !== 'function') {
-            return null;
-        }
-
-        try {
-            var formatter = new Intl.DateTimeFormat('en-US', {
-                timeZone: timeZone,
-                year: 'numeric',
-                month: '2-digit',
-                day: '2-digit',
-                hour: '2-digit',
-                minute: '2-digit',
-                second: '2-digit',
-                hour12: false
-            });
-            var parts = formatter.formatToParts(date);
-            var values = {};
-            parts.forEach(function(part) {
-                if (part.type && part.type !== 'literal') {
-                    values[part.type] = part.value;
-                }
-            });
-            if (!values.year || !values.month || !values.day || !values.hour || !values.minute || !values.second) {
-                return null;
-            }
-            var formattedUtc = Date.UTC(
-                parseInt(values.year, 10),
-                parseInt(values.month, 10) - 1,
-                parseInt(values.day, 10),
-                parseInt(values.hour, 10),
-                parseInt(values.minute, 10),
-                parseInt(values.second, 10)
-            );
-            return formattedUtc - date.getTime();
-        } catch (e) {
-            return null;
-        }
-    }
-
-    function getAmsterdamTimestamp(year, month, day, hour, minute) {
-        var utcDate = new Date(Date.UTC(year, month, day, hour, minute, 0));
-        var offsetMs = getTimezoneOffsetMs('Europe/Amsterdam', utcDate);
-        if (typeof offsetMs === 'number') {
-            return utcDate.getTime() - offsetMs;
-        }
-        return utcDate.getTime();
-    }
-
-    function parseDepartureTimestamp(dep, serviceDate) {
-        if (dep && typeof dep.timestamp === 'number') {
-            return dep.timestamp * 1000;
-        }
-
-        var time = (dep && (dep.expected_time || dep.time) || '').trim();
-        var match = time.match(/^(\d{2}):(\d{2})/);
-        if (!match) {
-            return null;
-        }
-
-        var year = parseInt(serviceDate.substring(0, 4), 10);
-        var month = parseInt(serviceDate.substring(5, 7), 10) - 1;
-        var day = parseInt(serviceDate.substring(8, 10), 10);
-        var hour = parseInt(match[1], 10);
-        var minute = parseInt(match[2], 10);
-
-        var ts = getAmsterdamTimestamp(year, month, day, hour, minute);
-        if (isNaN(ts)) {
-            return null;
-        }
-        return ts;
-    }
-
-    function shouldShowDeparture(dep, serviceDate) {
-        if (!dep || typeof dep !== 'object') {
-            return false;
-        }
-
-        var delay = Number(dep.delay_seconds || 0);
-        var isExtra = !!dep.is_extra;
-        var ts = parseDepartureTimestamp(dep, serviceDate);
-        var now = Date.now();
-
-        // Bus visibility keeps its established behaviour. The stricter live
-        // timestamp validation below fixes train-number matching only.
-        if (stop.type !== 'train') {
-            if (delay > 0 || (dep.expected_time && ('' + dep.expected_time).trim() !== '') || isExtra) {
-                return true;
-            }
-            return ts === null ? true : now <= ts + (15 * 60 * 1000);
-        }
-
-        var liveTs = null;
-        if (dep.expected_time) {
-            var expected = ('' + dep.expected_time).trim();
-            var expectedMatch = expected.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
-            if (expectedMatch) {
-                liveTs = getAmsterdamTimestamp(parseInt(expectedMatch[1], 10), parseInt(expectedMatch[2], 10) - 1, parseInt(expectedMatch[3], 10), parseInt(expectedMatch[4], 10), parseInt(expectedMatch[5], 10));
-            }
-        }
-
-        // A live timestamp is authoritative for its visibility. Never keep an
-        // already departed train merely because expected_time is populated.
-        if (liveTs !== null && !isNaN(liveTs)) {
-            return now <= liveTs + (60 * 1000);
-        }
-        if (ts === null) {
-            return isExtra;
-        }
-        return now <= ts + Math.max(delay, 0) * 1000 + (60 * 1000);
-    }
-
     function formatDepartureTime(dep) {
         var time = escapeHtml(dep.time || '');
         if (dep.is_cancelled) {
-            return '<span style="color:#d00;font-weight:700;">Rijdt niet</span>';
+            return '<span style="color:#d00;text-decoration:line-through;">' + time + '</span> <span style="color:#d00;font-weight:700;">(vervallen)</span>';
         }
-    var delay = Number(dep.delay_seconds || 0);
-    if (dep.expected_time) {
-        // expected_time is the live time; retain the delay indicator as well.
-        var m = ('' + dep.expected_time).match(/(\d{2}:\d{2})(?::\d{2})?$/);
-        if (m) {
-            return m[1] + formatDelaySuffix(delay);
-        }
-        var ts = parseDepartureTimestamp(dep, serviceDate);
-        if (ts !== null) {
-            var dt = new Date(ts);
-            if (!isNaN(dt.getTime())) {
-                var hh = dt.getHours();
-                var mm = dt.getMinutes();
-                return (hh < 10 ? '0' + hh : hh) + ':' + (mm < 10 ? '0' + mm : mm) + formatDelaySuffix(delay);
-            }
-        }
-        try {
-            var dt2 = new Date(dep.expected_time);
-            if (!isNaN(dt2.getTime())) {
-                var hh2 = dt2.getHours();
-                var mm2 = dt2.getMinutes();
-                return (hh2 < 10 ? '0' + hh2 : hh2) + ':' + (mm2 < 10 ? '0' + mm2 : mm2) + formatDelaySuffix(delay);
-            }
-        } catch (e) {
-            // fallthrough
-        }
-    }
-    if (delay === 0) {
-        return time;
-    }
-    var minutes = Math.ceil(Math.abs(delay) / 60);
-    var sign = delay > 0 ? '+' : '-';
-    var color = delay > 0 ? '#d00' : '#0a0';
-    return time + ' <span style="color:' + color + ';">' + sign + minutes + '</span>';
-    }
-    function formatDelaySuffix(delay) {
-        if (!delay) {
-            return '';
+        var delay = Number(dep.delay_seconds || 0);
+        if (delay === 0) {
+            return time;
         }
         var minutes = Math.ceil(Math.abs(delay) / 60);
         var sign = delay > 0 ? '+' : '-';
         var color = delay > 0 ? '#d00' : '#0a0';
-        return ' <span style="color:' + color + ';">' + sign + minutes + '</span>';
+        return time + ' <span style="color:' + color + ';">' + sign + minutes + '</span>';
     }
 
     if (stop.departures && stop.departures.length > 0) {
-        var visibleDepartures = stop.departures.filter(function(dep) {
-            return shouldShowDeparture(dep, serviceDate);
-        });
+        var depItems = stop.departures.map(function(dep) {
+            var lineLabel = escapeHtml(dep.line || '');
+            var destLabel = escapeHtml(dep.destination || '');
+            var timeLabel = formatDepartureTime(dep);
+            var url = '';
 
-        if (visibleDepartures.length > 0) {
-            var depItems = visibleDepartures.map(function(dep) {
-                var lineLabel = escapeHtml(dep.line || '');
-                var destLabel = escapeHtml(dep.destination || '');
-                var timeLabel = formatDepartureTime(dep);
-
-                if (dep.is_extra) {
-                    var extraLineBadge = '<span style="display:inline-block;padding:1px 6px;border-radius:4px;font-size:11px;font-weight:bold;background-color:#003082;color:#ffffff;margin-right:4px;">' + lineLabel + '</span>';
-                    var extraTag = ' <span style="background-color:#003082;color:#ffffff;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:bold;margin-left:4px;display:inline-block;">Extra trein</span>';
-                    return '<div style="margin-top:3px;font-size:12px;line-height:1.5;">- ' + extraLineBadge + ' → ' + destLabel + extraTag + ' <span style="font-weight:bold;">' + timeLabel + '</span></div>';
-                }
-
-                var url = '';
-
-                if (stop.type === 'bus' && dep.lineRef) {
-                    var direction = dep.direction || 'outbound';
-                    var busBaseUrl = config.lineScheduleUrl || (scheduleBaseUrl + 'dienstregeling/');
-                    var sepBus = busBaseUrl.indexOf('?') !== -1 ? '&' : '?';
-                    url = busBaseUrl + sepBus + 'ovld_direction=' + encodeURIComponent(direction) + '&ovld_line=' + encodeURIComponent(dep.lineRef) + '&ovld_variant=' + serviceDate;
-                } else if (stop.type === 'train' && dep.direction) {
-                    var trainBaseUrl = config.trainScheduleUrl || (scheduleBaseUrl + 'treindienstregeling/');
-                    var sepTrain = trainBaseUrl.indexOf('?') !== -1 ? '&' : '?';
-                    url = trainBaseUrl + sepTrain + 'direction=' + encodeURIComponent(dep.direction) + '&ovtd_direction=' + encodeURIComponent(dep.direction) + '&ovtd_variant=' + serviceDate;
-                }
-
-                if (url) {
-                    return '<div style="margin-top:2px;"><a href="' + escapeHtml(url) + '" target="_blank" style="color:inherit;text-decoration:none;font-size:12px;line-height:1.4;">- ' + lineLabel + ' → ' + destLabel + ' <span style="font-weight:bold;">' + timeLabel + '</span></a></div>';
-                }
-                return '<div style="margin-top:2px;font-size:12px;line-height:1.4;">- ' + lineLabel + ' → ' + destLabel + ' <span style="font-weight:bold;">' + timeLabel + '</span></div>';
-            }).join('');
-
-            if (depItems) {
-                departuresHtml = '<div style="margin-top:12px;font-size:12px;line-height:1.4;"><strong>Volgende geplande ritten:</strong><div style="margin-top:4px;">' + depItems + '</div></div>';
+            if (stop.type === 'bus' && dep.lineRef && dep.transport_mode !== 'water') {
+                var direction = dep.direction || 'outbound';
+                var busBaseUrl = config.lineScheduleUrl || (scheduleBaseUrl + 'dienstregeling/');
+                var sepBus = busBaseUrl.indexOf('?') !== -1 ? '&' : '?';
+                url = busBaseUrl + sepBus + 'ovld_direction=' + encodeURIComponent(direction) + '&ovld_line=' + encodeURIComponent(dep.lineRef) + '&ovld_variant=' + serviceDate;
+            } else if (stop.type === 'boat' || dep.transport_mode === 'water') {
+                var direction = dep.direction || 'outbound';
+                var boatBaseUrl = config.boatScheduleUrl || (scheduleBaseUrl + 'veerdienstregeling/');
+                var sepBoat = boatBaseUrl.indexOf('?') !== -1 ? '&' : '?';
+                url = boatBaseUrl + sepBoat + 'ovbo_direction=' + encodeURIComponent(direction) + '&ovbo_line=' + encodeURIComponent(dep.lineRef) + '&ovbo_variant=' + serviceDate;
+            } else if (stop.type === 'train' && dep.direction) {
+                var trainBaseUrl = config.trainScheduleUrl || (scheduleBaseUrl + 'treindienstregeling/');
+                var sepTrain = trainBaseUrl.indexOf('?') !== -1 ? '&' : '?';
+                url = trainBaseUrl + sepTrain + 'direction=' + encodeURIComponent(dep.direction) + '&ovtd_direction=' + encodeURIComponent(dep.direction) + '&ovtd_variant=' + serviceDate;
             }
+
+            if (url) {
+                return '<div style="margin-top:2px;"><a href="' + escapeHtml(url) + '" target="_blank" style="color:inherit;text-decoration:none;font-size:12px;line-height:1.4;">- ' + lineLabel + ' → ' + destLabel + ' <span style="font-weight:bold;">' + timeLabel + '</span></a></div>';
+            }
+            return '<div style="margin-top:2px;font-size:12px;line-height:1.4;">- ' + lineLabel + ' → ' + destLabel + ' <span style="font-weight:bold;">' + timeLabel + '</span></div>';
+        }).join('');
+
+        if (depItems) {
+            departuresHtml = '<div style="margin-top:12px;font-size:12px;line-height:1.4;"><strong>Volgende geplande ritten:</strong><div style="margin-top:4px;">' + depItems + '</div></div>';
         }
     }
 

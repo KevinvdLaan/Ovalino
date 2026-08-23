@@ -2,7 +2,7 @@
 /**
  * Plugin Name: OV Trein Dienstregeling
  * Description: Toon treindienstregelingen voor ritten die minimaal één keer in Groningen of Drenthe stoppen, op basis van de NS IFF-dataset.
- * Version: 1.0.8
+ * Version: 1.0.12
  * Author: Kevin van der Laan
  * License: GPL-2.0-or-later
  */
@@ -12,9 +12,10 @@ if (!defined('ABSPATH')) {
 }
 
 class OV_Trein_Dienstregeling {
-	const VERSION = '1.0.8';
+	const VERSION = '1.0.12';
 	const OPTION_IMPORT_INFO = 'ovtd_import_info';
 	const OPTION_HIDDEN_DIRECTIONS = 'ovtd_hidden_directions';
+	const OPTION_HIDDEN_SCHEDULE_DIRECTIONS = 'ovtd_hidden_schedule_directions';
 	const OPTION_IMPORT_STATE = 'ovtd_import_state';
 	const OPTION_DIRECTION_SIGNATURE = 'ovtd_direction_signature';
 	const NONCE_UPLOAD = 'ovtd_upload_datasets';
@@ -326,7 +327,8 @@ class OV_Trein_Dienstregeling {
 
 	private static function render_settings_form() {
 		$directions = self::get_directions(true);
-		$hidden = self::get_hidden_directions();
+		$hidden_completely = self::get_hidden_directions();
+		$hidden_schedule = self::get_hidden_schedule_directions();
 		if (empty($directions)) {
 			echo '<p>Nog geen richtingen beschikbaar. Voer eerst een import uit.</p>';
 			return;
@@ -362,14 +364,38 @@ class OV_Trein_Dienstregeling {
 			</table>
 			<hr />
 
-			<h2>Richtingen verbergen</h2>
-			<table class="widefat striped" style="max-width: 900px; margin-bottom: 20px;">
-				<thead><tr><th>Verbergen</th><th>Richting</th></tr></thead>
+			<h2>Richtingen & Dienstregelingen Beheren</h2>
+			<p>Beheer hier per richting hoe deze op de website wordt getoond:</p>
+			<ul style="list-style: disc; margin-left: 20px; color: #555;">
+				<li><strong>Alleen uit dienstregeling verbergen:</strong> Verbergt de richting in het keuzemenu van de volledige dienstregelingstabel. De vertrektijden worden wel getoond op halteborden en op de kaart (zonder doorklik-link).</li>
+				<li><strong>Helemaal verbergen:</strong> Verbergt de richting overal volledig (niet in het keuzemenu, niet op halteborden en niet op de kaart).</li>
+			</ul>
+			<table class="widefat striped" style="max-width: 950px; margin-bottom: 20px;">
+				<thead>
+					<tr>
+						<th>Richting</th>
+						<th style="width: 220px; text-align: center;">Alleen uit dienstregeling verbergen<br /><span style="font-weight:normal; font-size:11px;">(tijden wel tonen, zonder link)</span></th>
+						<th style="width: 170px; text-align: center;">Helemaal verbergen<br /><span style="font-weight:normal; font-size:11px;">(overal onzichtbaar)</span></th>
+					</tr>
+				</thead>
 				<tbody>
-					<?php foreach ($directions as $direction) : ?>
+					<?php foreach ($directions as $direction) :
+						$ref = $direction['direction_ref'];
+					?>
 						<tr>
-							<td><input type="checkbox" name="hidden_directions[]" value="<?php echo esc_attr($direction['direction_ref']); ?>" <?php checked(in_array($direction['direction_ref'], $hidden, true)); ?> /></td>
-							<td><?php echo esc_html($direction['label']); ?></td>
+							<td><strong><?php echo esc_html($direction['label']); ?></strong></td>
+							<td style="text-align: center;">
+								<label>
+									<input type="checkbox" name="hidden_schedule_directions[]" value="<?php echo esc_attr($ref); ?>" <?php checked(in_array($ref, $hidden_schedule, true)); ?> />
+									Verberg tabel
+								</label>
+							</td>
+							<td style="text-align: center;">
+								<label>
+									<input type="checkbox" name="hidden_directions[]" value="<?php echo esc_attr($ref); ?>" <?php checked(in_array($ref, $hidden_completely, true)); ?> />
+									Overal verbergen
+								</label>
+							</td>
 						</tr>
 					<?php endforeach; ?>
 				</tbody>
@@ -443,9 +469,14 @@ class OV_Trein_Dienstregeling {
 			wp_die(esc_html__('Je hebt geen rechten om dit uit te voeren.', 'ovtd'));
 		}
 		check_admin_referer(self::NONCE_SETTINGS);
+
 		$hidden = isset($_POST['hidden_directions']) && is_array($_POST['hidden_directions']) ? wp_unslash($_POST['hidden_directions']) : array();
 		$hidden = array_values(array_unique(array_filter(array_map('sanitize_text_field', $hidden))));
 		update_option(self::OPTION_HIDDEN_DIRECTIONS, $hidden, false);
+
+		$hidden_schedule = isset($_POST['hidden_schedule_directions']) && is_array($_POST['hidden_schedule_directions']) ? wp_unslash($_POST['hidden_schedule_directions']) : array();
+		$hidden_schedule = array_values(array_unique(array_filter(array_map('sanitize_text_field', $hidden_schedule))));
+		update_option(self::OPTION_HIDDEN_SCHEDULE_DIRECTIONS, $hidden_schedule, false);
 
 		$logos = isset($_POST['operator_logos']) && is_array($_POST['operator_logos']) ? wp_unslash($_POST['operator_logos']) : array();
 		$sanitized_logos = array();
@@ -453,7 +484,6 @@ class OV_Trein_Dienstregeling {
 			$sanitized_logos[sanitize_text_field($op_code)] = esc_url_raw($url);
 		}
 		update_option('ovtd_operator_logos', $sanitized_logos, false);
-
 
 		wp_safe_redirect(add_query_arg(array('page' => 'ov-trein-dienstregeling', 'updated' => 'true'), admin_url('admin.php')));
 		exit;
@@ -813,7 +843,21 @@ class OV_Trein_Dienstregeling {
 		return $imported;
 	}
 
+	private static function normalize_dat_line($line) {
+		if (!is_string($line)) {
+			return $line;
+		}
+		if (!mb_check_encoding($line, 'UTF-8')) {
+			$converted = @mb_convert_encoding($line, 'UTF-8', 'Windows-1252, ISO-8859-1, CP850');
+			if ($converted !== false) {
+				return $converted;
+			}
+		}
+		return $line;
+	}
+
 	private static function parse_station_line($line) {
+		$line = self::normalize_dat_line($line);
 		$line = rtrim($line, "\r\n");
 		if ($line === '' || $line[0] === '@') {
 			return null;
@@ -900,7 +944,8 @@ class OV_Trein_Dienstregeling {
 		$y = (int) $y_raw;
 		$in_gr = ($x >= 228000 && $x <= 290000 && $y >= 548000 && $y <= 596000);
 		$in_dr = ($x >= 205000 && $x <= 278000 && $y >= 512000 && $y <= 565000);
-		return $in_gr || $in_dr;
+		$in_fr = ($x >= 150000 && $x <= 235000 && $y >= 530000 && $y <= 605000);
+		return $in_gr || $in_dr || $in_fr;
 	}
 
 	private static $companies = array();
@@ -1250,9 +1295,25 @@ class OV_Trein_Dienstregeling {
 	private static function parse_trip_header($line) {
 		$body = substr($line, 1);
 		$parts = array_map('trim', explode(',', $body));
+
+		/*
+		 * Normaal staat het treinnummer in veld 2 (parts[1]) en is veld 3
+		 * (parts[2], het "rijnummer") leeg. Voor sommige ritten - onder
+		 * andere de 700-voorloopserie zoals 700726 - is dit omgekeerd: veld 2
+		 * is dan een placeholder ("00000") en staat het daadwerkelijke
+		 * treinnummer in veld 3. Zonder deze check werd zo'n rit opgeslagen
+		 * met train_number "0", waardoor hij onvindbaar leek na import.
+		 */
+		$primary = isset($parts[1]) ? trim((string) $parts[1]) : '';
+		$secondary = isset($parts[2]) ? trim((string) $parts[2]) : '';
+		$primary_is_placeholder = ($primary === '' || (ctype_digit($primary) && (int) $primary === 0));
+		$secondary_is_number = ($secondary !== '' && ctype_digit($secondary) && (int) $secondary !== 0);
+
+		$train_number_source = ($primary_is_placeholder && $secondary_is_number) ? $secondary : $primary;
+
 		return array(
 			'company_code' => isset($parts[0]) ? $parts[0] : '',
-			'train_number' => isset($parts[1]) ? self::normalize_train_number($parts[1]) : '',
+			'train_number' => self::normalize_train_number($train_number_source),
 			'line_code' => isset($parts[5]) ? trim((string) $parts[5]) : '',
 		);
 	}
@@ -2217,9 +2278,15 @@ class OV_Trein_Dienstregeling {
 			return $a['sort_ts'] - $b['sort_ts'];
 		});
 
+		$hidden_completely = self::get_hidden_directions();
 		$items = array();
 		foreach ($processed_candidates as $cand) {
 			$row = $cand['row'];
+			// Volledig verborgen richtingen overslaan (niet tonen op halteborden).
+			$dir_ref = isset($row['direction_ref']) ? trim((string) $row['direction_ref']) : '';
+			if ($dir_ref !== '' && in_array($dir_ref, $hidden_completely, true)) {
+				continue;
+			}
 			$is_extra = !empty($row['is_extra_train']);
 			$train_type = !empty($row['train_type']) ? (string) $row['train_type'] : 'Trein';
 			$line_code = !empty($row['line_code']) ? strtoupper(trim((string) $row['line_code'])) : '';
@@ -2262,6 +2329,12 @@ class OV_Trein_Dienstregeling {
 		$direction_ref = trim((string) $direction_ref);
 		$service_date = trim((string) $service_date);
 		if ($direction_ref === '' || $service_date === '') {
+			return '';
+		}
+		// Geen link als de richting volledig verborgen is of alleen uit de dienstregeling verborgen.
+		$hidden_completely = self::get_hidden_directions();
+		$hidden_schedule   = self::get_hidden_schedule_directions();
+		if (in_array($direction_ref, $hidden_completely, true) || in_array($direction_ref, $hidden_schedule, true)) {
 			return '';
 		}
 		if ($base_url === '') {
@@ -2345,18 +2418,35 @@ class OV_Trein_Dienstregeling {
 		return is_array($hidden) ? array_values(array_filter($hidden)) : array();
 	}
 
+	public static function get_hidden_schedule_directions() {
+		$hidden = get_option(self::OPTION_HIDDEN_SCHEDULE_DIRECTIONS, array());
+		return is_array($hidden) ? array_values(array_filter($hidden)) : array();
+	}
+
+	/**
+	 * Geeft alle richtingen die in het dienstregeling-dropdown mogen verschijnen.
+	 *
+	 * @param bool $include_hidden  true = alles teruggeven (voor admin-UI).
+	 */
 	private static function get_directions($include_hidden = false) {
 		global $wpdb;
-		$hidden = self::get_hidden_directions();
 		$rows = $wpdb->get_results('SELECT * FROM ' . self::table('directions') . ' ORDER BY label ASC', ARRAY_A);
-		if ($include_hidden || empty($hidden)) {
+		if ($include_hidden) {
+			return $rows ? $rows : array();
+		}
+		// Voor de frontend-dropdown: filter zowel volledig verborgen als alleen-uit-dienstregeling-verborgen richtingen.
+		$hidden_completely = self::get_hidden_directions();
+		$hidden_schedule   = self::get_hidden_schedule_directions();
+		if (empty($hidden_completely) && empty($hidden_schedule)) {
 			return $rows ? $rows : array();
 		}
 		return array_values(
 			array_filter(
 				$rows,
-				function ($row) use ($hidden) {
-					return !in_array($row['direction_ref'], $hidden, true);
+				function ($row) use ($hidden_completely, $hidden_schedule) {
+					$ref = $row['direction_ref'];
+					return !in_array($ref, $hidden_completely, true)
+					    && !in_array($ref, $hidden_schedule, true);
 				}
 			)
 		);
@@ -2706,7 +2796,7 @@ class OV_Trein_Dienstregeling {
 		$realtime_delays = array();
 		if ($service_date === self::get_current_service_date()) {
 			$realtime_delays = self::get_realtime_delays_for_journeys($journeys, $stops, $service_date);
-			list($extra_journeys, $extra_times, $extra_delays) = self::get_realtime_extra_train_columns($journeys, $stops, $service_date);
+			list($extra_journeys, $extra_times, $extra_delays) = self::get_realtime_extra_train_columns($journeys, $stops, $times, $service_date);
 			if (!empty($extra_journeys)) {
 				$journeys = array_merge($journeys, $extra_journeys);
 				$times = array_merge($times, $extra_times);
@@ -2747,7 +2837,28 @@ class OV_Trein_Dienstregeling {
 					<div class="ovtd-grid <?php echo esc_attr($density_class); ?>" style="--ovtd-columns: <?php echo esc_attr((string) $journey_count); ?>;">
 						<div class="ovtd-stop ovtd-head">Station</div>
 						<?php foreach ($journeys as $journey) : ?>
-							<div class="ovtd-time ovtd-head"><?php if (!empty($journey['is_extra_train'])) : ?><span class="ov-extra-train-badge" style="background-color:#003082;color:#fff;padding:2px 4px;border-radius:3px;font-size:10px;white-space:nowrap;">Extra trein <?php echo esc_html($journey['train_number']); ?></span><?php endif; ?></div>
+							<?php
+							/*
+							 * Elke kolom moet een zichtbaar label hebben, niet alleen de
+							 * "Extra trein"-kolommen. Zonder dit bleef de kolom van een
+							 * losstaand, wél gewoon geannuleerde REGULIERE rit (bv. de rit
+							 * die door een extra trein wordt vervangen) volledig leeg in de
+							 * header, waardoor die kolom visueel aan de ernaast liggende
+							 * "Extra trein"-kolom leek te hangen - alsof de extra trein zelf
+							 * de rit was die "Rijdt niet" toonde, terwijl het in werkelijkheid
+							 * twee aparte, allebei correcte kolommen zijn.
+							 */
+							$col_line = !empty($journey['line_code']) ? strtoupper(trim((string) $journey['line_code'])) : '';
+							$col_number = isset($journey['train_number']) ? (string) $journey['train_number'] : '';
+							$col_label = trim($col_line . ' ' . $col_number);
+							?>
+							<div class="ovtd-time ovtd-head">
+								<?php if (!empty($journey['is_extra_train'])) : ?>
+									<span class="ov-extra-train-badge" style="background-color:#003082;color:#fff;padding:2px 4px;border-radius:3px;font-size:10px;white-space:nowrap;">Extra trein <?php echo esc_html($col_number); ?></span>
+								<?php elseif ($col_label !== '') : ?>
+									<span class="ovtd-regular-train-label" style="font-size:11px;font-weight:700;color:#861121;white-space:nowrap;"><?php echo esc_html($col_label); ?></span>
+								<?php endif; ?>
+							</div>
 						<?php endforeach; ?>
 						<?php
 						$last_index = count($stops) - 1;
@@ -2761,14 +2872,16 @@ class OV_Trein_Dienstregeling {
 								$cell = isset($times[$key]) ? $times[$key] : array('departure' => '', 'arrival' => '');
 								$display = self::stop_display_time($cell, $stop_index, $last_index);
 								$d_key = $journey['journey_ref'] . '|' . strtolower($stop['station_code']);
-								$d_info = isset($realtime_delays[$d_key]) ? $realtime_delays[$d_key] : null;
+								$d_info = isset($realtime_delays[$d_key]) ? $realtime_delays[$d_key] : self::get_delay_info_for_journey($realtime_delays, $journey['journey_ref'], $stop['station_code']);
 
 								$prev_st = ($stop_index > 0) ? $stops[$stop_index - 1]['station_code'] : '';
 								$next_st = ($stop_index < $last_index) ? $stops[$stop_index + 1]['station_code'] : '';
 								$prev_k = $prev_st !== '' ? $journey['journey_ref'] . '|' . strtolower($prev_st) : '';
 								$next_k = $next_st !== '' ? $journey['journey_ref'] . '|' . strtolower($next_st) : '';
-								$prev_canc = ($prev_k !== '' && !empty($realtime_delays[$prev_k]['is_cancelled']));
-								$next_canc = ($next_k !== '' && !empty($realtime_delays[$next_k]['is_cancelled']));
+								$prev_delay = $prev_st !== '' ? (isset($realtime_delays[$prev_k]) ? $realtime_delays[$prev_k] : self::get_delay_info_for_journey($realtime_delays, $journey['journey_ref'], $prev_st)) : null;
+								$next_delay = $next_st !== '' ? (isset($realtime_delays[$next_k]) ? $realtime_delays[$next_k] : self::get_delay_info_for_journey($realtime_delays, $journey['journey_ref'], $next_st)) : null;
+								$prev_canc = ($prev_delay && !empty($prev_delay['is_cancelled']));
+								$next_canc = ($next_delay && !empty($next_delay['is_cancelled']));
 
 								$departure_attr = ($stop_index === 0 && $display !== '') ? ' data-ovtd-departure="' . esc_attr((string) self::service_day_order_seconds((int) $journey['departure_seconds'])) . '"' : '';
 								?>
@@ -2823,7 +2936,12 @@ class OV_Trein_Dienstregeling {
 					<div class="ovtd-print-grid" style="--ovtd-columns: <?php echo esc_attr((string) count($chunk_journeys)); ?>;">
 						<div class="ovtd-stop ovtd-head">Station</div>
 						<?php foreach ($chunk_journeys as $journey) : ?>
-							<div class="ovtd-time ovtd-head"></div>
+							<?php
+							$print_col_line = !empty($journey['line_code']) ? strtoupper(trim((string) $journey['line_code'])) : '';
+							$print_col_number = isset($journey['train_number']) ? (string) $journey['train_number'] : '';
+							$print_col_label = trim(($print_col_line !== '' ? $print_col_line . ' ' : '') . (!empty($journey['is_extra_train']) ? 'Extra ' : '') . $print_col_number);
+							?>
+							<div class="ovtd-time ovtd-head"><?php echo esc_html($print_col_label); ?></div>
 						<?php endforeach; ?>
 						<?php foreach ($stops as $stop_index => $stop) :
 							$row_class = ($stop_index % 2 === 0) ? 'ovtd-row-even' : 'ovtd-row-odd';
@@ -2867,6 +2985,13 @@ class OV_Trein_Dienstregeling {
 			'Intercity direct' => 'ICD',
 			'Sprinter' => 'Spr',
 			'Sneltrein' => 'Snl',
+			'Stopbus ipv trein' => 'Bus',
+			'Snelbus ipv trein' => 'Sbus',
+			'OV-bus ipv trein' => 'OV',
+			'Metro ipv trein' => 'Mtr',
+			'Tram ipv trein' => 'Trm',
+			'Taxibus ipv trein' => 'Tax',
+			'Belbus ipv trein' => 'Bel',
 		);
 		return isset($map[$train_type]) ? $map[$train_type] : mb_substr($train_type, 0, 3);
 		
@@ -2898,9 +3023,9 @@ class OV_Trein_Dienstregeling {
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
 				'
-				SELECT js.journey_ref, js.station_code, s.station_name, js.stop_order
+				SELECT js.journey_ref, js.station_code, COALESCE(NULLIF(s.station_name, \'\'), UPPER(js.station_code)) AS station_name, js.stop_order
 				FROM ' . self::table('journey_stops') . ' js
-				INNER JOIN ' . self::table('stations') . ' s ON s.station_code = js.station_code
+				LEFT JOIN ' . self::table('stations') . ' s ON s.station_code = js.station_code
 				WHERE js.journey_ref IN (' . $placeholders . ')
 				ORDER BY js.journey_ref ASC, js.stop_order ASC
 				',
@@ -3205,14 +3330,16 @@ class OV_Trein_Dienstregeling {
 								continue;
 							}
 							$d_key = $journey['journey_ref'] . '|' . strtolower($stop['station_code']);
-							$d_info = isset($realtime_delays[$d_key]) ? $realtime_delays[$d_key] : null;
+							$d_info = isset($realtime_delays[$d_key]) ? $realtime_delays[$d_key] : self::get_delay_info_for_journey($realtime_delays, $journey['journey_ref'], $stop['station_code']);
 
 							$prev_st = ($stop_index > 0) ? $stops[$stop_index - 1]['station_code'] : '';
 							$next_st = ($stop_index < $last_index) ? $stops[$stop_index + 1]['station_code'] : '';
 							$prev_k = $prev_st !== '' ? $journey['journey_ref'] . '|' . strtolower($prev_st) : '';
 							$next_k = $next_st !== '' ? $journey['journey_ref'] . '|' . strtolower($next_st) : '';
-							$prev_canc = ($prev_k !== '' && !empty($realtime_delays[$prev_k]['is_cancelled']));
-							$next_canc = ($next_k !== '' && !empty($realtime_delays[$next_k]['is_cancelled']));
+							$prev_delay = $prev_st !== '' ? (isset($realtime_delays[$prev_k]) ? $realtime_delays[$prev_k] : self::get_delay_info_for_journey($realtime_delays, $journey['journey_ref'], $prev_st)) : null;
+							$next_delay = $next_st !== '' ? (isset($realtime_delays[$next_k]) ? $realtime_delays[$next_k] : self::get_delay_info_for_journey($realtime_delays, $journey['journey_ref'], $next_st)) : null;
+							$prev_canc = ($prev_delay && !empty($prev_delay['is_cancelled']));
+							$next_canc = ($next_delay && !empty($next_delay['is_cancelled']));
 							?>
 							<div class="ovtd-mobile-stop-row">
 								<span><?php echo esc_html($stop['station_name']); ?></span>
@@ -3227,7 +3354,29 @@ class OV_Trein_Dienstregeling {
 		return ob_get_clean();
 	}
 
-	private static function get_realtime_extra_train_columns(array $journeys, array $stops, $service_date) {
+	/**
+	 * Zet een "H:i"-tijdstring om naar een absoluut Unix-timestamp op de juiste
+	 * kalenderdag, met dezelfde 05:00-grens als service_day_order_seconds(): tijden
+	 * vóór 05:00 horen bij de kalenderdag ná $service_date (nachtritten).
+	 */
+	private static function time_str_to_seconds_timestamp($time_str, $service_date) {
+		if (!preg_match('/^(\d{2}):(\d{2})$/', (string) $time_str, $m)) {
+			return null;
+		}
+		if ($service_date === '') {
+			return null;
+		}
+		$seconds_of_day = ((int) $m[1]) * HOUR_IN_SECONDS + ((int) $m[2]) * MINUTE_IN_SECONDS;
+		$day_offset = $seconds_of_day < self::SERVICE_DAY_START_SECONDS ? DAY_IN_SECONDS : 0;
+		try {
+			$base_date = new DateTimeImmutable($service_date . ' 00:00:00', wp_timezone());
+		} catch (Exception $e) {
+			return null;
+		}
+		return $base_date->modify('+' . ($day_offset + $seconds_of_day) . ' seconds')->getTimestamp();
+	}
+
+	private static function get_realtime_extra_train_columns(array $journeys, array $stops, array $times, $service_date) {
 		global $wpdb;
 		$extra_journeys = array(); $extra_times = array(); $extra_delays = array();
 		$base_journeys = array();
@@ -3235,19 +3384,159 @@ class OV_Trein_Dienstregeling {
 		if (empty($base_journeys)) return array($extra_journeys, $extra_times, $extra_delays);
 		$table = $wpdb->prefix . 'ovhi_realtime_delays';
 		if (!(bool) $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $table))) return array($extra_journeys, $extra_times, $extra_delays);
-		$rows = $wpdb->get_results($wpdb->prepare("SELECT journey_ref, stop_code, delay_seconds, is_cancelled, expected_time, is_extra_train FROM $table WHERE updated_at >= %s AND expected_time IS NOT NULL AND is_extra_train = 1", gmdate('Y-m-d H:i:s', time() - HOUR_IN_SECONDS)), ARRAY_A);
+		$rows = $wpdb->get_results($wpdb->prepare("SELECT journey_ref, stop_code, delay_seconds, is_cancelled, expected_time, is_extra_train FROM $table WHERE updated_at >= %s AND expected_time IS NOT NULL", gmdate('Y-m-d H:i:s', time() - HOUR_IN_SECONDS)), ARRAY_A);
 		$timezone = wp_timezone(); $now = new DateTimeImmutable('now', $timezone); $today_at_five = new DateTimeImmutable($now->format('Y-m-d') . ' 05:00:00', $timezone); $window_start = $now < $today_at_five ? $today_at_five->modify('-1 day') : $today_at_five; $window_end = $window_start->modify('+1 day'); $grouped = array();
 		foreach ((array) $rows as $row) {
-			$number = trim((string) $row['journey_ref']); $base_number = self::extract_base_train_number($number);
-			if ($base_number === null || !isset($base_journeys[$base_number])) continue;
+			$number = trim((string) $row['journey_ref']);
+			$base_number = self::extract_base_train_number($number);
+			if (empty($row['is_extra_train']) && $base_number === null) continue;
+			$target_base = $base_number !== null ? $base_number : ltrim($number, '0');
+			if (!isset($base_journeys[$target_base])) continue;
 			try { $expected = new DateTimeImmutable((string) $row['expected_time'], wp_timezone()); } catch (Exception $e) { continue; }
 			if ($expected >= $window_start && $expected < $window_end) $grouped[$number][] = $row;
 		}
 		foreach ($grouped as $number => $train_rows) {
-			$base = $base_journeys[self::extract_base_train_number($number)]; $virtual_ref = 'ovtd-extra:' . $number; $first_ts = null;
-			foreach ($train_rows as $row) { $ts = (new DateTimeImmutable((string) $row['expected_time'], wp_timezone()))->getTimestamp(); $first_ts = $first_ts === null ? $ts : min($first_ts, $ts); }
-			$local = (new DateTimeImmutable('@' . $first_ts))->setTimezone(wp_timezone()); $virtual = $base; $virtual['journey_ref'] = $virtual_ref; $virtual['train_number'] = $number; $virtual['is_extra_train'] = true; $virtual['departure_seconds'] = (int) $local->format('G') * HOUR_IN_SECONDS + (int) $local->format('i') * MINUTE_IN_SECONDS; $extra_journeys[] = $virtual;
-			foreach ($train_rows as $row) foreach ($stops as $stop) if (strtolower((string) $stop['station_code']) === strtolower(trim((string) $row['stop_code']))) { $time = (new DateTimeImmutable((string) $row['expected_time'], wp_timezone()))->format('H:i'); $extra_times[$virtual_ref . '|' . $stop['station_code']] = array('arrival' => $time, 'departure' => $time); $extra_delays[$virtual_ref . '|' . strtolower((string) $stop['station_code'])] = array('delay_seconds' => (int) $row['delay_seconds'], 'is_cancelled' => !empty($row['is_cancelled'])); break; }
+			$base = $base_journeys[self::extract_base_train_number($number)];
+			$base_ref = (string) $base['journey_ref'];
+			$virtual_ref = 'ovtd-extra:' . $number;
+
+			// Routevolgorde van de basisrit ophalen: welke halte komt op welke positie.
+			// Hiermee bepalen we de ECHTE eerste (op volgorde) gemelde halte van deze
+			// extra trein, i.p.v. simpelweg de kleinste gerapporteerde tijd te pakken -
+			// die kan een latere, wél al gemelde tussenstop zijn zolang de feed nog
+			// geen update voor het beginstation heeft gestuurd. Dat gaf voorheen een
+			// verkeerde vertrektijd (en dus een verkeerde plek in de tabel).
+			$stop_orders = array();
+			foreach ($wpdb->get_results($wpdb->prepare('SELECT station_code, stop_order FROM ' . self::table('journey_stops') . ' WHERE journey_ref = %s', $base_ref), ARRAY_A) as $sr) {
+				$stop_orders[strtolower((string) $sr['station_code'])] = (int) $sr['stop_order'];
+			}
+
+			// Ankerhalte: de eerste halte (op routevolgorde) waarvoor deze extra
+			// trein daadwerkelijk een live-update heeft. Alleen gebruikt om de
+			// vertrektijd correct te positioneren en om overige haltes een
+			// geëxtrapoleerde TIJD te geven - niet om ergens een annulering te
+			// verzinnen. Annulering/vertraging tonen we uitsluitend letterlijk
+			// zoals InfoPlus die per halte meldt (zie hieronder); we leiden dat
+			// bewust niet meer af naar haltes waar InfoPlus zelf niets over heeft
+			// gezegd, want dat bleek in de praktijk onbetrouwbaar (een enkele,
+			// op zichzelf correcte annulering van bv. alleen de eerste halte
+			// zorgde er eerder voor dat de hele rest van de route ten onrechte
+			// als "Rijdt niet" werd getoond).
+			$anchor_row = null; $anchor_order = PHP_INT_MAX;
+			foreach ($train_rows as $row) {
+				$scode = strtolower(trim((string) $row['stop_code']));
+				if (!isset($stop_orders[$scode])) {
+					continue;
+				}
+				if ($stop_orders[$scode] < $anchor_order) {
+					$anchor_order = $stop_orders[$scode];
+					$anchor_row = $row;
+				}
+			}
+
+			if ($anchor_row !== null) {
+				$first_ts = (new DateTimeImmutable((string) $anchor_row['expected_time'], wp_timezone()))->getTimestamp();
+			} else {
+				// Geen van de gemelde haltes komt voor in de routevolgorde van de
+				// basisrit - val terug op de oude heuristiek (kleinste tijd) i.p.v.
+				// deze trein helemaal niet te tonen.
+				$first_ts = null;
+				foreach ($train_rows as $row) { $ts = (new DateTimeImmutable((string) $row['expected_time'], wp_timezone()))->getTimestamp(); $first_ts = $first_ts === null ? $ts : min($first_ts, $ts); }
+			}
+
+			// Offset tussen de live-gemelde tijd op het ankerstation en de geplande
+			// tijd van de basisrit op diezelfde halte. Gebruiken we hieronder om
+			// haltes zonder eigen live-update van deze extra trein een realistische
+			// geëxtrapoleerde tijd te geven, i.p.v. helemaal niets te tonen.
+			$anchor_offset_seconds = null;
+			if ($anchor_row !== null) {
+				$anchor_scode = strtolower(trim((string) $anchor_row['stop_code']));
+				$anchor_key = $base_ref . '|' . $anchor_scode;
+				if (isset($times[$anchor_key]) && $times[$anchor_key]['departure'] !== '') {
+					$anchor_scheduled_ts = self::time_str_to_seconds_timestamp($times[$anchor_key]['departure'], $service_date);
+					if ($anchor_scheduled_ts !== null) {
+						$anchor_offset_seconds = $first_ts - $anchor_scheduled_ts;
+					}
+				}
+			}
+
+			/*
+			 * De vertrektijd die we voor deze kolom tonen (en waarop de trein in de
+			 * tabel gepositioneerd wordt) moet de vertrektijd van de ECHTE eerste
+			 * halte van de route zijn - niet zomaar de ruwe gerapporteerde tijd van
+			 * de ankerhalte. Zodra de ankerhalte niet toevallig ook de eerste halte
+			 * van de route is (bv. omdat de feed alleen vanaf een latere halte iets
+			 * heeft gestuurd), gaf de oude code hier de tijd van díe latere halte
+			 * weer als was het de vertrektijd - dat is precies de "niet altijd de
+			 * juiste vertrektijd"-klacht. Extrapoleer daarom terug naar de eerste
+			 * halte van de basisroute met dezelfde offset die we ook voor de overige
+			 * haltes gebruiken.
+			 */
+			$departure_ts = $first_ts;
+			$origin_code = null; $origin_order = PHP_INT_MAX;
+			foreach ($stop_orders as $scode => $order) {
+				if ($order < $origin_order) {
+					$origin_order = $order;
+					$origin_code = $scode;
+				}
+			}
+			if ($origin_code !== null && $anchor_offset_seconds !== null) {
+				$origin_key = $base_ref . '|' . $origin_code;
+				if (isset($times[$origin_key]) && $times[$origin_key]['departure'] !== '') {
+					$origin_scheduled_ts = self::time_str_to_seconds_timestamp($times[$origin_key]['departure'], $service_date);
+					if ($origin_scheduled_ts !== null) {
+						$departure_ts = $origin_scheduled_ts + $anchor_offset_seconds;
+					}
+				}
+			}
+
+			$local = (new DateTimeImmutable('@' . $departure_ts))->setTimezone(wp_timezone());
+			$virtual = $base; $virtual['journey_ref'] = $virtual_ref; $virtual['train_number'] = $number; $virtual['is_extra_train'] = true; $virtual['departure_seconds'] = (int) $local->format('G') * HOUR_IN_SECONDS + (int) $local->format('i') * MINUTE_IN_SECONDS; $extra_journeys[] = $virtual;
+
+			// Live-gerapporteerde haltes zetten (zoals voorheen).
+			$reported_stations = array();
+			foreach ($train_rows as $row) foreach ($stops as $stop) if (strtolower((string) $stop['station_code']) === strtolower(trim((string) $row['stop_code']))) {
+				$time = (new DateTimeImmutable((string) $row['expected_time'], wp_timezone()))->format('H:i');
+				$extra_times[$virtual_ref . '|' . $stop['station_code']] = array('arrival' => $time, 'departure' => $time);
+				$extra_delays[$virtual_ref . '|' . strtolower((string) $stop['station_code'])] = array('delay_seconds' => (int) $row['delay_seconds'], 'is_cancelled' => !empty($row['is_cancelled']));
+				$reported_stations[strtolower((string) $stop['station_code'])] = true;
+				break;
+			}
+
+			// Overige haltes van de basisrit invullen met een geëxtrapoleerde tijd
+			// (geplande tijd van de basisrit + geobserveerde offset t.o.v. het
+			// ankerstation), zodat de dienstregeling niet halverwege afbreekt zoals
+			// voorheen - dit gold zeker voor een geannuleerde extra trein, waarvoor
+			// de feed vaak alleen bij een deel van de haltes een update stuurt.
+			foreach ($stops as $stop) {
+				$scode = strtolower((string) $stop['station_code']);
+				if (isset($reported_stations[$scode]) || !isset($stop_orders[$scode])) {
+					continue;
+				}
+				$base_key = $base_ref . '|' . $scode;
+				if (!isset($times[$base_key])) {
+					continue;
+				}
+				$base_cell = $times[$base_key];
+				$extrapolated = array('arrival' => '', 'departure' => '');
+				foreach (array('arrival', 'departure') as $field) {
+					if ($base_cell[$field] === '') {
+						continue;
+					}
+					$sched_ts = self::time_str_to_seconds_timestamp($base_cell[$field], $service_date);
+					if ($sched_ts === null) {
+						continue;
+					}
+					$adjusted = $anchor_offset_seconds !== null ? $sched_ts + $anchor_offset_seconds : $sched_ts;
+					$extrapolated[$field] = (new DateTimeImmutable('@' . $adjusted))->setTimezone(wp_timezone())->format('H:i');
+				}
+				if ($extrapolated['arrival'] !== '' || $extrapolated['departure'] !== '') {
+					// Letterlijk: deze halte krijgt alleen een (geëxtrapoleerde) TIJD.
+					// Geen is_cancelled/delay hier - die tonen we uitsluitend op de
+					// halte(s) waar InfoPlus dat zelf voor deze trein heeft gemeld.
+					$extra_times[$virtual_ref . '|' . $stop['station_code']] = $extrapolated;
+				}
+			}
 		}
 		return array($extra_journeys, $extra_times, $extra_delays);
 	}
@@ -3291,59 +3580,15 @@ class OV_Trein_Dienstregeling {
 			$rows = $wpdb->get_results($wpdb->prepare($query, ...$params), ARRAY_A);
 			if (!empty($rows)) {
 				/*
-				 * A lookup value can be a bare train_number (see above), and the
-				 * SAME train_number is sometimes reused later the same service day
-				 * for a completely different, unrelated working. Because $st_codes
-				 * covers every station of the whole route (merged across all
-				 * journeys shown in this table), a live update for that later,
-				 * unrelated working can share a station_code with an EARLIER
-				 * scheduled_ref's own route -- most commonly its very first station,
-				 * since many directions share the same origin. Without checking the
-				 * time, that live update would get attributed to every scheduled_ref
-				 * that matches the same train_number, making a delay recorded later
-				 * in the day appear to belong to an earlier journey's own stop.
-				 * Guard against this the same way add_scheduled_journey_delay_entries()
-				 * in OV Halte Importer already does: only accept a match for a given
-				 * scheduled_ref when the scheduled time at that specific stop is
-				 * plausibly close to when the update was reported.
+				 * Zelfde matchingsprincipe als OV Halte Importer en Ovalino Map:
+				 * een journey_ref/stop_code-match is geldig, met specificiteit
+				 * als veiligheidsnet tegen hergebruikte treinnummers.
 				 */
-				$stop_scheduled_seconds = array();
-				if ($service_date !== '') {
-					$refs_for_stops = array();
-					foreach ($journeys as $journey) {
-						if (!empty($journey['journey_ref'])) {
-							$refs_for_stops[] = (string) $journey['journey_ref'];
-						}
-					}
-					$refs_for_stops = array_values(array_unique($refs_for_stops));
-					if (!empty($refs_for_stops)) {
-						$stop_placeholders = implode(',', array_fill(0, count($refs_for_stops), '%s'));
-						$stop_rows = $wpdb->get_results(
-							$wpdb->prepare(
-								'SELECT journey_ref, station_code, departure_seconds, arrival_seconds FROM ' . self::table('journey_stops') . ' WHERE journey_ref IN (' . $stop_placeholders . ')',
-								$refs_for_stops
-							),
-							ARRAY_A
-						);
-						foreach ($stop_rows as $sr) {
-							$dep = isset($sr['departure_seconds']) ? (int) $sr['departure_seconds'] : -1;
-							$arr = isset($sr['arrival_seconds']) ? (int) $sr['arrival_seconds'] : -1;
-							$seconds = $dep >= 0 ? $dep : $arr;
-							if ($seconds < 0) {
-								continue;
-							}
-							$stop_scheduled_seconds[$sr['journey_ref'] . '|' . strtolower((string) $sr['station_code'])] = $seconds;
-						}
-					}
-				}
-
-				$service_tz = wp_timezone();
-				// InfoPlus levert per station zowel de actuele tijd als de vertraging.
-				// Alleen als actuele tijd - vertraging vrijwel gelijk is aan de geplande
-				// tijd van exact die stop, mag een ritnummermatch worden gebruikt.
-				// Dit voorkomt dat een update voor het eindstation bij een eerdere stop
-				// terechtkomt wanneer een treinnummer binnen de servicedag wordt hergebruikt.
-				$scheduled_match_tolerance_seconds = 5 * MINUTE_IN_SECONDS;
+				usort($rows, function ($a, $b) {
+					$a_specificity = substr_count((string) $a['journey_ref'], ':');
+					$b_specificity = substr_count((string) $b['journey_ref'], ':');
+					return $b_specificity <=> $a_specificity;
+				});
 
 				foreach ($rows as $r) {
 					if ($service_date !== '' && !empty($r['service_date']) && (string) $r['service_date'] !== (string) $service_date) {
@@ -3352,77 +3597,10 @@ class OV_Trein_Dienstregeling {
 					$stop_code_lower = strtolower($r['stop_code']);
 					$matched_refs = isset($scheduled_refs_by_lookup[$r['journey_ref']]) ? $scheduled_refs_by_lookup[$r['journey_ref']] : array($r['journey_ref']);
 
-					$expected_ts = null;
-					if (!empty($r['expected_time'])) {
-						try {
-							$expected_ts = (new DateTimeImmutable((string) $r['expected_time'], $service_tz))->getTimestamp();
-						} catch (Exception $e) {
-							$expected_ts = null;
-						}
-					}
-
 					foreach ($matched_refs as $matched_ref) {
-						$sched_key = $matched_ref . '|' . $stop_code_lower;
-						if ($service_date !== '' && isset($stop_scheduled_seconds[$sched_key])) {
-							try {
-								$scheduled_dt = new DateTimeImmutable($service_date . ' 00:00:00', $service_tz);
-								$scheduled_dt = $scheduled_dt->modify('+' . $stop_scheduled_seconds[$sched_key] . ' seconds');
-								if ($expected_ts !== null) {
-									$reported_planned_ts = $expected_ts - (int) $r['delay_seconds'];
-									if (abs($scheduled_dt->getTimestamp() - $reported_planned_ts) > $scheduled_match_tolerance_seconds) {
-										continue;
-									}
-								} elseif ((string) $r['journey_ref'] !== (string) $matched_ref) {
-									// Zonder een actuele tijd kunnen we een los treinnummer niet veilig
-									// aan één van meerdere dienstregelingsritten koppelen.
-									continue;
-								}
-							} catch (Exception $e) {
-								continue;
-							}
-						} elseif ((string) $r['journey_ref'] !== (string) $matched_ref) {
-							continue;
-						}
-						$delays[$matched_ref . '|' . $stop_code_lower] = $r;
-					}
-				}
-
-				// Heuristic: if multiple downstream stops are marked cancelled for the same scheduled journey,
-				// treat the earliest cancelled stop as the start of the cancellation and avoid marking
-				// upstream stops as cancelled. This reduces false positives when external feeds set
-				// cancellation flags for several later stops.
-				$station_index = array();
-				foreach ($st_codes as $idx => $scode) {
-					$station_index[$scode] = $idx;
-				}
-
-				// For each scheduled_ref, find the earliest cancelled stop index (if any)
-				$earliest_cancel = array();
-				foreach ($delays as $key => $info) {
-					list($sched, $scode) = explode('|', $key, 2);
-					if (!empty($info['is_cancelled'])) {
-						if (isset($station_index[$scode])) {
-							$idx = $station_index[$scode];
-							if (!isset($earliest_cancel[$sched]) || $idx < $earliest_cancel[$sched]) {
-								$earliest_cancel[$sched] = $idx;
-							}
-						}
-					}
-				}
-
-				// If we found an earliest cancelled stop for a scheduled journey, ensure only stations
-				// at or after that index are treated as cancelled for that journey.
-				if (!empty($earliest_cancel)) {
-					foreach ($earliest_cancel as $sched => $start_idx) {
-						foreach ($st_codes as $scode) {
-							$key = $sched . '|' . $scode;
-							if (isset($delays[$key])) {
-								$idx = isset($station_index[$scode]) ? $station_index[$scode] : PHP_INT_MAX;
-								if ($idx < $start_idx) {
-									// Upstream of the earliest cancelled stop: clear cancellation flag
-									$delays[$key]['is_cancelled'] = 0;
-								}
-							}
+						$key = $matched_ref . '|' . $stop_code_lower;
+						if (!isset($delays[$key])) {
+							$delays[$key] = $r;
 						}
 					}
 				}

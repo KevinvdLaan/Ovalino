@@ -19,42 +19,94 @@ import io
 import argparse
 import threading
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone, tzinfo
 import json
 
 
-# MySQL DATETIME values have no timezone. Normalize InfoPlus timestamps to
-# Europe/Amsterdam before storage so they match timetable wall-clock times.
-try:
-    NL_TIMEZONE = ZoneInfo('Europe/Amsterdam')
-except Exception:
-    # Windows/Python deployments may lack the IANA tzdata package.
-    NL_TIMEZONE = datetime.now().astimezone().tzinfo or timezone(timedelta(hours=1))
+class AmsterdamTZ(tzinfo):
+    """Timezone implementation for Europe/Amsterdam (CET/CEST)."""
+    def utcoffset(self, dt):
+        return timedelta(hours=2) if self._is_dst(dt) else timedelta(hours=1)
+
+    def dst(self, dt):
+        return timedelta(hours=1) if self._is_dst(dt) else timedelta(0)
+
+    def tzname(self, dt):
+        return 'CEST' if self._is_dst(dt) else 'CET'
+
+    def _is_dst(self, dt):
+        if dt is None:
+            return False
+        year = dt.year
+        # Last Sunday of March (02:00 local)
+        start = datetime(year, 3, 31)
+        start = start - timedelta(days=(start.weekday() + 1) % 7)
+        start = start.replace(hour=2)
+        # Last Sunday of October (03:00 local)
+        end = datetime(year, 10, 31)
+        end = end - timedelta(days=(end.weekday() + 1) % 7)
+        end = end.replace(hour=3)
+        dt_naive = dt.replace(tzinfo=None) if dt.tzinfo else dt
+        return start <= dt_naive < end
 
 
-def expected_time_from_value(value):
-    value = str(value or '').strip()
-    if not value:
+AMSTERDAM_TZ = AmsterdamTZ()
+
+
+def parse_and_format_datetime(raw_val, add_delay_seconds=0):
+    """Parse an ISO 8601 string or time string into Europe/Amsterdam 'YYYY-MM-DD HH:MM:SS'."""
+    if not raw_val:
+        return None
+    val = str(raw_val).strip()
+    if not val:
         return None
     try:
-        if re.match(r'^\d{4}-\d{2}-\d{2}T', value):
-            parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
-            if parsed.tzinfo is not None:
-                parsed = parsed.astimezone(NL_TIMEZONE)
+        # Check ISO format with date
+        if 'T' in val:
+            v = val
+            if v.endswith('Z') or v.endswith('z'):
+                v = v[:-1] + '+00:00'
+            dt = datetime.fromisoformat(v)
+            if dt.tzinfo is not None:
+                dt_local = dt.astimezone(AMSTERDAM_TZ)
             else:
-                parsed = parsed.replace(tzinfo=NL_TIMEZONE)
-            return parsed.strftime('%Y-%m-%d %H:%M:%S')
-        parsed_time = datetime.strptime(value[:8], '%H:%M:%S' if value.count(':') >= 2 else '%H:%M')
-        now = datetime.now(NL_TIMEZONE)
-        parsed = now.replace(hour=parsed_time.hour, minute=parsed_time.minute, second=parsed_time.second, microsecond=0)
-        if (parsed - now).total_seconds() < -43200:
-            parsed += timedelta(days=1)
-        elif (parsed - now).total_seconds() > 43200:
-            parsed -= timedelta(days=1)
-        return parsed.strftime('%Y-%m-%d %H:%M:%S')
-    except (TypeError, ValueError):
-        return None
+                dt_local = dt
+            if add_delay_seconds:
+                dt_local += timedelta(seconds=add_delay_seconds)
+            return dt_local.strftime('%Y-%m-%d %H:%M:%S')
+
+        # Check HH:MM or HH:MM:SS
+        m = re.match(r'^(\d{1,2}):(\d{2})(?::(\d{2}))?$', val)
+        if m:
+            now_local = datetime.now(AMSTERDAM_TZ)
+            h = int(m.group(1))
+            mi = int(m.group(2))
+            s = int(m.group(3) or 0)
+            dt_local = now_local.replace(hour=h, minute=mi, second=s, microsecond=0)
+            if add_delay_seconds:
+                dt_local += timedelta(seconds=add_delay_seconds)
+            return dt_local.strftime('%Y-%m-%d %H:%M:%S')
+    except Exception:
+        pass
+    return None
+
+
+def compute_service_date(expected_time=None):
+    """Return the service date YYYY-MM-DD in Europe/Amsterdam timezone (service day boundary at 05:00)."""
+    if expected_time:
+        try:
+            dt = datetime.strptime(expected_time, '%Y-%m-%d %H:%M:%S')
+            if dt.hour < 5:
+                dt = dt - timedelta(days=1)
+            return dt.strftime('%Y-%m-%d')
+        except Exception:
+            pass
+    now = datetime.now(AMSTERDAM_TZ)
+    if now.hour < 5:
+        now = now - timedelta(days=1)
+    return now.strftime('%Y-%m-%d')
+
+
 try:
     import zmq
 except ImportError:
@@ -242,11 +294,21 @@ except Exception:
 
 class DelayDatabase:
     """Manages MySQL connection and updates for realtime delays."""
+    # Ververs de verbinding proactief ruim binnen elke realistische
+    # wait_timeout/firewall-idle-limiet (bijv. 2 uur), in plaats van te
+    # vertrouwen op ping() om een "stille" dode verbinding te detecteren.
+    # Een geblackholede (firewall/NAT weggegooide) TCP-verbinding levert
+    # namelijk geen fout op ping() - de read hangt voor onbepaalde tijd,
+    # zonder een expliciete socket-timeout hieronder.
+    CONNECTION_MAX_AGE_SECONDS = 1800
+    SOCKET_TIMEOUT_SECONDS = 10
+
     def __init__(self, db_config):
         self.config = db_config
         self.table_name = db_config['prefix'] + 'ovhi_realtime_delays'
         self.conn = None
         self.lock = threading.Lock()
+        self.connected_at = 0
         self.connect()
 
     def connect(self):
@@ -257,28 +319,51 @@ class DelayDatabase:
                     user=self.config['user'],
                     password=self.config['password'],
                     database=self.config['database'],
-                    autocommit=True
+                    autocommit=True,
+                    connection_timeout=self.SOCKET_TIMEOUT_SECONDS,
                 )
+                # mysql-connector-python's connection_timeout alleen dekt de
+                # initiële TCP-handshake, niet latere reads/writes. Zet ook
+                # de onderliggende socket-timeout, zodat een stilgevallen
+                # verbinding een fout geeft in plaats van voor altijd te
+                # hangen op de eerstvolgende query.
+                try:
+                    sock = self.conn._socket.sock if hasattr(self.conn, '_socket') else None
+                    if sock is not None:
+                        sock.settimeout(self.SOCKET_TIMEOUT_SECONDS)
+                except Exception:
+                    pass
             else:
                 self.conn = mysql.connect(
                     host=self.config['host'],
                     user=self.config['user'],
                     password=self.config['password'],
                     database=self.config['database'],
-                    autocommit=True
+                    autocommit=True,
+                    connect_timeout=self.SOCKET_TIMEOUT_SECONDS,
+                    read_timeout=self.SOCKET_TIMEOUT_SECONDS,
+                    write_timeout=self.SOCKET_TIMEOUT_SECONDS,
                 )
+            self.connected_at = time.monotonic()
             print(f"[DB] Connected successfully to {self.config['database']}")
         except Exception as e:
             print(f"[DB Error] Connection failed: {e}")
             self.conn = None
+            self.connected_at = 0
 
     def ensure_connection(self):
         if self.conn is None:
             self.connect()
             return
+        if (time.monotonic() - self.connected_at) > self.CONNECTION_MAX_AGE_SECONDS:
+            # Proactief verversen voordat de verbinding oud genoeg is om
+            # door een firewall/NAT/wait_timeout te worden weggegooid.
+            self.connect()
+            return
         try:
             if hasattr(self.conn, 'ping'):
                 self.conn.ping(reconnect=True)
+                self.connected_at = time.monotonic()
         except Exception:
             self.connect()
 
@@ -289,6 +374,8 @@ class DelayDatabase:
         """
         if not journey_ref or not stop_code:
             return
+        if not service_date:
+            service_date = compute_service_date(expected_time)
         with self.lock:
             self.ensure_connection()
             if not self.conn:
@@ -311,7 +398,22 @@ class DelayDatabase:
                 cursor.execute(sql, params)
                 cursor.close()
             except Exception as e:
-                print(f"[DB Error] upsert failed: {e}")
+                # Fallback if optional columns don't exist yet in old schema
+                try:
+                    cursor = self.conn.cursor()
+                    sql_fallback = f"""
+                        INSERT INTO {self.table_name} (journey_ref, stop_code, delay_seconds, is_cancelled, expected_time, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, NOW())
+                        ON DUPLICATE KEY UPDATE
+                            delay_seconds = VALUES(delay_seconds),
+                            is_cancelled = VALUES(is_cancelled),
+                            expected_time = VALUES(expected_time),
+                            updated_at = NOW()
+                    """
+                    cursor.execute(sql_fallback, (journey_ref, stop_code, int(delay_seconds), 1 if is_cancelled else 0, expected_time))
+                    cursor.close()
+                except Exception as e2:
+                    print(f"[DB Error] upsert failed: {e2}")
 
     def cleanup_old_records(self):
         """Delete records older than 1 hour."""
@@ -345,34 +447,14 @@ class DelayNormalizer:
         self._lock = threading.Lock()
 
     def _canonical_journey_key(self, journey_ref):
-        """Return the grouping key used to buffer updates for a journey.
-
-        IMPORTANT: this must NOT collapse NS-style 6-digit replacement/extra-train
-        numbers (e.g. 300552, 306034 -- a "3" or "69" prefix in front of the base
-        train number) onto their base train number (e.g. '552', '6034').
-
-        A replacement/extra-train number identifies a genuinely different, separate
-        service that NS runs alongside (part of) the original train's route -- it is
-        not just an alternate spelling of the same journey_ref. Earlier this method
-        used extract_base_train_number() to strip that prefix so both numbers shared
-        one buffer, which meant cancellation/"Rijdt"-status entries reported for the
-        replacement train got mixed into the earliest-cancelled-stop calculation for
-        the original train (and vice versa). In practice that caused the original
-        train to incorrectly show "Rijdt niet" on stations it was still actually
-        serving whenever a coupled replacement number was active for part of the
-        route. Each journey_ref (including 300xxx/69xxxx replacement numbers) is now
-        buffered and flushed independently, so a replacement train is treated as its
-        own separate journey rather than merged into the original's stop-order
-        mapping. See extract_base_train_number(), which is still used elsewhere
-        (e.g. by the PHP "Extra trein" display) purely to look up the base train's
-        line/destination for cosmetic display purposes -- that is a distinct,
-        display-only use and does not affect this buffering/grouping decision.
-        """
+        """Return a canonical key for grouping journey variants."""
         return str(journey_ref).strip()
 
     def buffer_entry(self, journey_ref, stop_code, delay_seconds, is_cancelled, expected_time=None, service_date=None, change_type=0, is_extra_train=False, infoplus_structured=False):
         if not journey_ref or not stop_code:
             return
+        if not service_date:
+            service_date = compute_service_date(expected_time)
         entry = {
             'journey_ref': str(journey_ref),
             'stop_code': str(stop_code),
@@ -408,6 +490,7 @@ class DelayNormalizer:
             for e in entries:
                 self.db.upsert_delay(e['journey_ref'], e['stop_code'], e['delay_seconds'], e['is_cancelled'], e['expected_time'], e.get('service_date'), e.get('change_type', 0), e.get('is_extra_train', False))
             return
+
         # Attempt to determine stop_order mapping from the timetable for this journey
         try:
             self.db.ensure_connection()
@@ -415,7 +498,7 @@ class DelayNormalizer:
             if not conn:
                 # Fallback: write raw
                 for e in entries:
-                    self.db.upsert_delay(e['journey_ref'], e['stop_code'], e['delay_seconds'], e['is_cancelled'], e['expected_time'], e.get('service_date'), e.get('change_type', 0), e.get('is_extra_train', False))
+                    self.db.upsert_delay(e['journey_ref'], e['stop_code'], e['delay_seconds'], e['is_cancelled'], e.get('expected_time'), e.get('service_date'))
                 return
 
             cursor = conn.cursor()
@@ -443,7 +526,7 @@ class DelayNormalizer:
                 # nothing to match on — fallback to raw write
                 cursor.close()
                 for e in entries:
-                    self.db.upsert_delay(e['journey_ref'], e['stop_code'], e['delay_seconds'], e['is_cancelled'], e['expected_time'], e.get('service_date'), e.get('change_type', 0), e.get('is_extra_train', False))
+                    self.db.upsert_delay(e['journey_ref'], e['stop_code'], e['delay_seconds'], e['is_cancelled'], e.get('expected_time'), e.get('service_date'))
                 return
 
             for cand in candidates:
@@ -500,7 +583,7 @@ class DelayNormalizer:
                 except Exception:
                     pass
                 for e in entries:
-                    self.db.upsert_delay(e['journey_ref'], e['stop_code'], e['delay_seconds'], e['is_cancelled'], e['expected_time'], e.get('service_date'), e.get('change_type', 0), e.get('is_extra_train', False))
+                    self.db.upsert_delay(e['journey_ref'], e['stop_code'], e['delay_seconds'], e['is_cancelled'], e['expected_time'])
                 return
 
             coverage_threshold_ratio = float(cfg.get('coverage_threshold', 0.5))
@@ -511,7 +594,7 @@ class DelayNormalizer:
                 except Exception:
                     pass
                 for e in entries:
-                    self.db.upsert_delay(e['journey_ref'], e['stop_code'], e['delay_seconds'], e['is_cancelled'], e['expected_time'], e.get('service_date'), e.get('change_type', 0), e.get('is_extra_train', False))
+                    self.db.upsert_delay(e['journey_ref'], e['stop_code'], e['delay_seconds'], e['is_cancelled'], e['expected_time'])
                 return
 
             # Use the chosen mapping
@@ -541,11 +624,11 @@ class DelayNormalizer:
 
             # After choosing a pattern_ref we only merge buffered entries that map
             # to the same pattern_ref/time_ref to avoid merging unrelated services.
+            to_merge_keys = []
+            merged_entries = []
             try:
                 cfg = load_normalization_config()
                 merge_tolerance_seconds = int(cfg.get('merge_tolerance_seconds', 120))
-                to_merge_keys = []
-                merged_entries = []
                 with self._lock:
                     for other_key, other_item in list(self._buffer.items()):
                         # skip self
@@ -603,13 +686,13 @@ class DelayNormalizer:
                             it['timer'].cancel()
                         except Exception:
                             pass
-
-                if merged_entries:
-                    entries.extend(merged_entries)
-                    logger = logging.getLogger('ov-realtime-daemon')
-                    logger.debug(f"[Normalizer Debug] merged keys={to_merge_keys} into {journey_ref}")
             except Exception:
                 pass
+
+            if merged_entries:
+                entries.extend(merged_entries)
+                logger = logging.getLogger('ov-realtime-daemon')
+                logger.debug(f"[Normalizer Debug] merged keys={to_merge_keys} into {journey_ref}")
 
 
             # Find earliest cancelled stop order among buffered entries where mapping exists
@@ -634,7 +717,7 @@ class DelayNormalizer:
             if earliest_cancel_order is None:
                 # Could not determine a mapped cancelled stop — write raw
                 for e in entries:
-                    self.db.upsert_delay(e['journey_ref'], e['stop_code'], e['delay_seconds'], e['is_cancelled'], e['expected_time'], e.get('service_date'), e.get('change_type', 0), e.get('is_extra_train', False))
+                    self.db.upsert_delay(e['journey_ref'], e['stop_code'], e['delay_seconds'], e['is_cancelled'], e.get('expected_time'), e.get('service_date'))
                 return
 
             # Clear is_cancelled for upstream stops (stop_order < earliest_cancel_order)
@@ -654,7 +737,7 @@ class DelayNormalizer:
 
             # Upsert all sanitized entries
             for e in entries:
-                self.db.upsert_delay(e['journey_ref'], e['stop_code'], e['delay_seconds'], e['is_cancelled'], e['expected_time'], e.get('service_date'), e.get('change_type', 0), e.get('is_extra_train', False))
+                self.db.upsert_delay(e['journey_ref'], e['stop_code'], e['delay_seconds'], e['is_cancelled'], e.get('expected_time'), e.get('service_date'))
 
         except Exception as exc:
             logger = logging.getLogger('ov-realtime-daemon')
@@ -662,7 +745,7 @@ class DelayNormalizer:
             # Fallback: write raw entries to ensure data reaches DB even on error
             for e in entries:
                 try:
-                    self.db.upsert_delay(e['journey_ref'], e['stop_code'], e['delay_seconds'], e['is_cancelled'], e['expected_time'], e.get('service_date'), e.get('change_type', 0), e.get('is_extra_train', False))
+                    self.db.upsert_delay(e['journey_ref'], e['stop_code'], e['delay_seconds'], e['is_cancelled'], e.get('expected_time'), e.get('service_date'))
                 except Exception:
                     continue
 
@@ -826,7 +909,9 @@ class KV78Subscriber(threading.Thread):
                 elif delay_seconds > 43200:
                     delay_seconds -= 86400
                 # derive expected_time as today + expected_dep
-                expected_time = expected_time_from_value(expected_dep)
+                today = datetime.now(AMSTERDAM_TZ)
+                exp_dt = today.replace(hour=e_dt.hour, minute=e_dt.minute, second=e_dt.second, microsecond=0)
+                expected_time = exp_dt.strftime('%Y-%m-%d %H:%M:%S')
             except Exception:
                 pass
 
@@ -840,15 +925,43 @@ class KV78Subscriber(threading.Thread):
         if journey_num.isdigit():
             journey_num = str(int(journey_num))
 
-        # Construct candidate journey_ref patterns
-        # NeTEx journey_ref format: NL:<OPERATOR>:ServiceJourney:<LINE>-<VARIANT>-<JOURNEY_NUM>-<AVAIL>
-        # Or simple fallback: JourneyNumber
+        # Normalize line_num op dezelfde manier (KV78 LinePlanningNumber). Gecontroleerd
+        # tegen de EBS/Qbuzz NeTEx-bronbestanden: dit is exact hetzelfde veld/dezelfde
+        # waarde als NeTEx's <PrivateCode type="LinePlanningNumber"> op Line-niveau
+        # (bv. "4247" voor EBS-lijn 247, "b510" voor Qbuzz-lijn 510) - NIET hetzelfde
+        # als het publieke lijnnummer (<PublicCode>, bv. "247"/"510"). Beide kanten
+        # (deze daemon en de WordPress-matching) moeten dus consequent met
+        # LinePlanningNumber vergelijken, nooit met het publieke lijnnummer.
+        line_num = str(line_num).strip()
+        if line_num.isdigit():
+            line_num = str(int(line_num))
+
+        # Construct candidate journey_ref patterns.
+        #
+        # BELANGRIJK: JourneyNumber is bij KV78turbo alleen uniek per
+        # vervoerder+lijn+dag, niet per vervoerder alleen. Twee lijnen van
+        # dezelfde (of zelfs verschillende) vervoerder(s) kunnen hetzelfde
+        # ritnummer gebruiken. Komen die toevallig ook langs dezelfde
+        # (drukke) halte, dan matchte een kaal ritnummer voorheen de
+        # verkeerde lijn/rit (haltes toonden "rijdt niet" voor een andere
+        # lijn dan de daadwerkelijk vervallen rit).
+        #
+        # Daarom is de lijn-gekwalificeerde vorm
+        # "<OPERATOR>:<LIJNNUMMER>:<RITNUMMER>" nu de primaire sleutel die
+        # we wegschrijven. Alleen als het lijnnummer echt ontbreekt in de
+        # feed vallen we terug op "<OPERATOR>:<RITNUMMER>" - nog steeds
+        # ambigu tussen lijnen van dezelfde vervoerder, maar beter dan
+        # niets. De volledig kale vorm (ritnummer zonder vervoerder/lijn)
+        # schrijven we bewust niet meer weg: dat was de meest gevaarlijke
+        # variant, want die kan ook nog tussen vervoerders botsen.
         journey_refs = set()
 
-        if data_owner:
+        if data_owner and line_num:
+            journey_refs.add(f"{data_owner}:{line_num}:{journey_num}")
+        elif data_owner:
             journey_refs.add(f"{data_owner}:{journey_num}")
-
-        journey_refs.add(str(journey_num))
+        else:
+            journey_refs.add(str(journey_num))
 
         for journey_ref in journey_refs:
             # Buffer via normalizer so upstream cancellations are suppressed where appropriate
@@ -879,8 +992,6 @@ class InfoPlusSubscriber(threading.Thread):
             codes_file = os.path.join(plugin_dir, 'infoplus_cancel_codes.json')
             if os.path.exists(codes_file):
                 import json
-
-
                 with open(codes_file, 'r', encoding='utf-8') as fh:
                     data = json.load(fh)
                     if isinstance(data, list):
@@ -924,9 +1035,7 @@ class InfoPlusSubscriber(threading.Thread):
         try:
             root = ET.fromstring(xml_content)
             # RitInfo is the authoritative, full train message. It contains
-            # TreinDatum and station/ritdeel WijzigingType; DVS does not carry
-            # enough context for correct ritbeeldmatching, so it must not
-            # overwrite these state records with a heuristic status mapping.
+            # TreinDatum and station/ritdeel WijzigingType per stop.
             for rit_info in find_elements_by_names(root, ['RitInfo']):
                 self.process_rit_info(rit_info)
         except Exception as exc:
@@ -937,14 +1046,14 @@ class InfoPlusSubscriber(threading.Thread):
 
         InfoPlus identifies a service by TreinDatum + TreinNummer. Change type
         24 means a separate Extra trein; 25 is a cancellation. Other change
-        types (notably 34, 36 and 37) are route changes, never cancellations.
+        types (notably 34, 36 and 37) are route/platform changes, never cancellations.
         """
-        train_num = find_text_any(rit_info, ['TreinNummer'])
+        train_num = find_text_any(rit_info, ['TreinNummer', 'RitNummer', 'LogischeRitNummer', 'Trein', 'JourneyRef'])
         train_date = find_text_any(rit_info, ['TreinDatum', 'Treindatum'])
-        if not train_num or not train_date:
+        if not train_num:
             return
         train_num = str(int(train_num)) if train_num.strip().isdigit() else train_num.strip()
-        train_date = train_date[:10]
+        train_date = train_date[:10] if train_date else compute_service_date()
 
         def direct_change_types(element):
             values = []
@@ -961,22 +1070,31 @@ class InfoPlusSubscriber(threading.Thread):
             if strip_namespace(element.tag).lower() == 'logischeritdeelstation':
                 station_code = find_text_any(element, ['StationCode'])
                 if station_code:
-                    departure_time = find_text_any(element, ['VertrekTijd'])
-                    arrival_time = find_text_any(element, ['AankomstTijd'])
-                    delay_value = find_text_any(element, ['ExacteVertrekVertraging', 'PresentatieVertrekVertraging', 'GedempteVertrekVertraging', 'ExacteAankomstVertraging', 'PresentatieAankomstVertraging', 'GedempteAankomstVertraging'])
+                    station_code = station_code.strip()
+                    m = re.match(r'^(?:nl:q:)(\d+)$', station_code, re.IGNORECASE)
+                    if m:
+                        station_code = f"NL:Q:{m.group(1)}"
+                    else:
+                        station_code = station_code.lower()
+
+                    departure_time = find_text_any(element, ['ActueleVertrekTijd', 'GeplandeVertrekTijd', 'VertrekTijd', 'KorteVertrekTijd'])
+                    arrival_time = find_text_any(element, ['ActueleAankomstTijd', 'GeplandeAankomstTijd', 'AankomstTijd', 'KorteAankomstTijd'])
+                    delay_value = find_text_any(element, ['ExacteVertrekVertraging', 'PresentatieVertrekVertraging', 'GedempteVertrekVertraging', 'ExacteAankomstVertraging', 'PresentatieAankomstVertraging', 'GedempteAankomstVertraging', 'VertrekVertraging', 'AankomstVertraging', 'Vertraging'])
+                    delay_sec = parse_iso_duration(delay_value)
+
                     is_extra = 24 in change_types
-                    is_cancelled = 25 in change_types
+                    is_cancelled = (25 in change_types) or any(c in self.infoplus_cancel_codes for c in change_types if c != 34)
                     change_type = 24 if is_extra else (25 if is_cancelled else (change_types[0] if change_types else 0))
-                    # A six-digit RitInfo train without WT24 is a documented
-                    # ritbeeldmatch. Apply each reported station to its base
-                    # train; this preserves the original train outside the
-                    # replacement segment and never creates an Extra trein.
+
+                    exp_time = parse_and_format_datetime(departure_time or arrival_time, delay_sec if ('geplande' in (departure_time or arrival_time or '').lower() or 'korte' in (departure_time or arrival_time or '').lower()) else 0)
+
                     target_train_num = train_num
                     if not is_extra:
                         base_train_num = extract_base_train_number(train_num)
                         if base_train_num:
                             target_train_num = base_train_num
-                    self.normalizer.buffer_entry(target_train_num, station_code.strip().lower(), parse_iso_duration(delay_value), is_cancelled, expected_time_from_value(departure_time or arrival_time), service_date=train_date, change_type=change_type, is_extra_train=is_extra, infoplus_structured=True)
+
+                    self.normalizer.buffer_entry(target_train_num, station_code, delay_sec, is_cancelled, exp_time, service_date=train_date, change_type=change_type, is_extra_train=is_extra, infoplus_structured=True)
                 return
             for child in list(element):
                 walk(child, change_types)
@@ -984,10 +1102,18 @@ class InfoPlusSubscriber(threading.Thread):
         # Preserve change types declared at RitInfo, LogischeRit and
         # LogischeRitDeel level for every station below that level.
         walk(rit_info, [])
+
     def process_dvs(self, dvs):
-        train_num = find_text_any(dvs, ['TreinNummer', 'RitId', 'RitNummer', 'LogischeRitNummer'])
-        station_code = find_text_any(dvs, ['StationCode'])
-        if not train_num or not station_code:
+        """Process DVS messages strictly scoping station code to RitStation."""
+        rit_station_el = None
+        for child in dvs.iter():
+            if strip_namespace(child.tag).lower() == 'ritstation':
+                rit_station_el = child
+                break
+        if rit_station_el is None:
+            return
+        station_code = find_text_any(rit_station_el, ['StationCode'])
+        if not station_code:
             return
 
         station_code = station_code.strip()
@@ -996,53 +1122,40 @@ class InfoPlusSubscriber(threading.Thread):
             station_code = f"NL:Q:{m.group(1)}"
         else:
             station_code = station_code.lower()
-        train_num = train_num.strip()
-        # Normalize to the canonical form without leading zeros. NS/InfoPlus
-        # normally sends unpadded numbers already ("3617"), but this keeps
-        # the daemon consistent with the zero-stripped train_number stored
-        # by ov-trein-dienstregeling.php's IFF import (which otherwise
-        # preserves fixed-width padding like "03617"), regardless of which
-        # side ends up padding in the future.
-        if train_num.isdigit():
-            train_num = str(int(train_num))
 
-        status_text = find_text_any(dvs, ['WijzigingType', 'RitStatus', 'RitStopStatus', 'InfoStatus']).upper().strip()
+        for trein in find_elements_by_names(dvs, ['Trein']):
+            train_num = find_text_any(trein, ['TreinNummer', 'RitId', 'RitNummer', 'LogischeRitNummer'])
+            if not train_num:
+                continue
+            train_num = train_num.strip()
+            if train_num.isdigit():
+                train_num = str(int(train_num))
 
-        is_cancelled = False
-        # Numeric status codes from InfoPlus: treat known codes as cancellation
-        try:
-            if status_text.isdigit():
-                code = int(status_text)
-                if code == 25:
-                    is_cancelled = True
-        except Exception:
-            pass
+            status_text = find_text_any(trein, ['WijzigingType', 'RitStatus', 'RitStopStatus', 'InfoStatus']).upper().strip()
+            is_cancelled = False
+            try:
+                if status_text.isdigit():
+                    code = int(status_text)
+                    if code == 25 or (code in self.infoplus_cancel_codes and code != 34):
+                        is_cancelled = True
+            except Exception:
+                pass
 
-        cancel_statuses = ('CANCEL', 'CANCELLED', 'VERVALLEN', 'GEANNULEERD', 'RIJDETNIET', 'NOTDRIVING', 'DELETED')
-        if status_text in cancel_statuses:
-            is_cancelled = True
+            cancel_statuses = ('CANCEL', 'CANCELLED', 'VERVALLEN', 'GEANNULEERD', 'RIJDETNIET', 'NOTDRIVING', 'DELETED')
+            if status_text in cancel_statuses:
+                is_cancelled = True
 
-        delay_seconds = 0
-        delay_elem = find_text_any(dvs, ['ExacteVertrekVertraging', 'PresentatieVertrekVertraging', 'GedempteVertrekVertraging', 'ExacteAankomstVertraging', 'PresentatieAankomstVertraging', 'GedempteAankomstVertraging', 'VertrekVertraging', 'AankomstVertraging', 'Vertraging'])
-        if delay_elem:
-            delay_seconds = parse_iso_duration(delay_elem)
+            delay_seconds = 0
+            delay_elem = find_text_any(trein, ['ExacteVertrekVertraging', 'PresentatieVertrekVertraging', 'GedempteVertrekVertraging', 'ExacteAankomstVertraging', 'PresentatieAankomstVertraging', 'GedempteAankomstVertraging', 'VertrekVertraging', 'AankomstVertraging', 'Vertraging'])
+            if delay_elem:
+                delay_seconds = parse_iso_duration(delay_elem)
 
-        # Try to extract an expected time if present in the dvs element
-        expected_time = None
-        try:
-            raw_xml = ET.tostring(dvs, encoding='utf-8', method='xml').decode('utf-8')
-            m = re.search(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+\-]\d{2}:?\d{2})?)', raw_xml)
-            if m:
-                expected_time = expected_time_from_value(m.group(1))
-            else:
-                m2 = re.search(r'(\d{2}:\d{2}(?::\d{2})?)', raw_xml)
-                if m2:
-                    expected_time = expected_time_from_value(m2.group(1))
-        except Exception:
-            expected_time = None
+            dep_time_raw = find_text_any(trein, ['ActueleVertrekTijd', 'GeplandeVertrekTijd', 'VertrekTijd', 'KorteVertrekTijd'])
+            arr_time_raw = find_text_any(trein, ['ActueleAankomstTijd', 'GeplandeAankomstTijd', 'AankomstTijd', 'KorteAankomstTijd'])
+            time_raw = dep_time_raw if dep_time_raw else arr_time_raw
+            expected_time = parse_and_format_datetime(time_raw, delay_seconds if time_raw and ('geplande' in time_raw.lower() or 'korte' in time_raw.lower()) else 0)
 
-        # Buffer via normalizer so upstream cancellations are suppressed where appropriate
-        self.normalizer.buffer_entry(train_num, station_code, delay_seconds, is_cancelled, expected_time)
+            self.normalizer.buffer_entry(train_num, station_code, delay_seconds, is_cancelled, expected_time, infoplus_structured=True)
 
 
 def main():
