@@ -228,7 +228,7 @@ def parse_datetime_value(value: str) -> Optional[datetime]:
 
 
 def format_datetime_value(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+    return dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
 def add_seconds_to_datetime_string(value: str, seconds: int) -> Optional[str]:
@@ -264,13 +264,8 @@ def parse_infoplus_message(raw_bytes: bytes, envelope: str) -> List[DelayRecord]
             return records
 
     now_iso = datetime.now(timezone.utc).isoformat()
-
-    journey_ref = None
-    stop_code = None
-    delay_seconds = 0
-    is_cancelled = False
-    expected_time = None
-    scheduled_time = None
+    now_utc = datetime.now(timezone.utc)
+    stale_cutoff = now_utc - timedelta(minutes=30)
 
     journey_ref_tags = ('treinnummer', 'logischeritnummer', 'ritnummer', 'ritid', 'trainid', 'journeyref', 'servicejourneyref', 'vehiclejourneyref')
     stop_code_tags = ('stationcode', 'stopcode', 'haltecode')
@@ -294,6 +289,154 @@ def parse_infoplus_message(raw_bytes: bytes, envelope: str) -> List[DelayRecord]
     status_tags = ('treinstatus', 'wijzigingtype', 'status', 'vervallen', 'tekst', 'infostatus', 'ritstopstatus', 'tripstopstatus')
     cancel_tokens = ('vervallen', 'cancelled', 'canceled', 'niet gereden', 'nietgereden', 'rijdetniet', 'rijdt niet', 'notdriving', 'deleted', 'nietopgevoerd')
     infoplus_cancel_codes = (25, 32, 34, 39, 44)
+
+    # 1. Check if this is a RitInfo message with multiple station stops (LogischeRitDeelStation)
+    station_elements = [el for el in root.iter() if strip_namespace(el.tag).lower() == 'logischeritdeelstation']
+    if station_elements:
+        train_num = None
+        global_cancelled = False
+        for el in root.iter():
+            t = strip_namespace(el.tag).lower()
+            if t in journey_ref_tags and not train_num:
+                v = extract_element_values(el)
+                if v:
+                    train_num = v[0]
+            if t == 'wijziging':
+                for ch in el:
+                    if strip_namespace(ch.tag).lower() == 'wijzigingtype':
+                        val = (ch.text or '').strip()
+                        if val.isdigit() and int(val) in (25,):
+                            global_cancelled = True
+
+        if train_num:
+            for station_elem in station_elements:
+                station_code = None
+                dep_time = None
+                arr_time = None
+                delay_sec = 0
+                is_canc = global_cancelled
+                exp_dt = None
+
+                for el in station_elem.iter():
+                    t = strip_namespace(el.tag).lower()
+                    v = extract_element_values(el)
+                    if not v:
+                        continue
+                    if t in stop_code_tags and not station_code:
+                        station_code = v[0].lower()
+                    elif t in ('actuelevertrektijd', 'geplandevertrektijd', 'vertrektijd', 'kortevertrektijd') and not dep_time:
+                        dep_time = v[0]
+                    elif t in ('actueleaankomsttijd', 'geplandeaankomsttijd', 'aankomsttijd', 'korteaankomsttijd') and not arr_time:
+                        arr_time = v[0]
+
+                    if dep_time and t in ('exactevertrekvertraging', 'presentatievertrekvertraging', 'gedemptevertrekvertraging', 'vertrekvertraging', 'vertraging'):
+                        parsed_d = parse_iso_duration(v[0])
+                        if parsed_d != 0 or delay_sec == 0:
+                            delay_sec = parsed_d
+                    elif not dep_time and t in ('exacteaankomstvertraging', 'presentatieaankomstvertraging', 'gedempteaankomstvertraging', 'aankomstvertraging', 'vertraging'):
+                        parsed_d = parse_iso_duration(v[0])
+                        if parsed_d != 0 or delay_sec == 0:
+                            delay_sec = parsed_d
+
+                    if t == 'stopt':
+                        if v[0].upper() in ('N', 'NEE', 'FALSE', '0'):
+                            is_canc = True
+                    elif t in status_tags:
+                        lowered = v[0].lower()
+                        if lowered.isdigit() and int(lowered) in infoplus_cancel_codes:
+                            is_canc = True
+                        elif any(tok in lowered for tok in cancel_tokens):
+                            is_canc = True
+
+                if not station_code:
+                    continue
+
+                base_time = dep_time or arr_time
+                if base_time:
+                    parsed_time = parse_datetime_value(base_time)
+                    if parsed_time is not None:
+                        is_actual = 'actueel' in (dep_time or '').lower() or 'actueel' in (arr_time or '').lower()
+                        exp_dt = parsed_time if is_actual else (parsed_time + timedelta(seconds=delay_sec))
+
+                # Skip stops already completed more than 30 minutes in the past
+                if exp_dt and not is_canc and exp_dt < stale_cutoff:
+                    continue
+
+                exp_time_str = format_datetime_value(exp_dt) if exp_dt else None
+                records.append(DelayRecord(
+                    journey_ref=train_num,
+                    stop_code=station_code,
+                    delay_seconds=delay_sec,
+                    is_cancelled=is_canc,
+                    source=envelope,
+                    updated_at=now_iso,
+                    expected_time=exp_time_str,
+                ))
+            return records
+
+    # 2. Check if this is a DVS message with multiple Trein elements
+    trein_elements = [el for el in root.iter() if strip_namespace(el.tag).lower() == 'trein']
+    if trein_elements:
+        board_station_code = None
+        for el in root.iter():
+            if strip_namespace(el.tag).lower() in stop_code_tags:
+                v = extract_element_values(el)
+                if v:
+                    board_station_code = v[0].lower()
+                    break
+
+        if board_station_code:
+            for trein in trein_elements:
+                train_num = None
+                delay_sec = 0
+                is_canc = False
+                exp_dt = None
+                for el in trein.iter():
+                    t = strip_namespace(el.tag).lower()
+                    v = extract_element_values(el)
+                    if not v:
+                        continue
+                    if t in journey_ref_tags and not train_num:
+                        train_num = v[0]
+                    elif t in delay_tags:
+                        parsed_d = parse_iso_duration(v[0])
+                        if parsed_d != 0 or delay_sec == 0:
+                            delay_sec = parsed_d
+                    elif t in expected_time_tags and not exp_dt:
+                        exp_dt = parse_datetime_value(v[0])
+                    elif t in scheduled_time_tags and not exp_dt:
+                        p_sched = parse_datetime_value(v[0])
+                        if p_sched:
+                            exp_dt = p_sched + timedelta(seconds=delay_sec)
+                    elif t in status_tags:
+                        lowered = v[0].lower()
+                        if lowered.isdigit() and int(lowered) in infoplus_cancel_codes:
+                            is_canc = True
+                        elif any(tok in lowered for tok in cancel_tokens):
+                            is_canc = True
+
+                if train_num:
+                    if exp_dt and not is_canc and exp_dt < stale_cutoff:
+                        continue
+                    exp_time_str = format_datetime_value(exp_dt) if exp_dt else None
+                    records.append(DelayRecord(
+                        journey_ref=train_num,
+                        stop_code=board_station_code,
+                        delay_seconds=delay_sec,
+                        is_cancelled=is_canc,
+                        source=envelope,
+                        updated_at=now_iso,
+                        expected_time=exp_time_str,
+                    ))
+            return records
+
+    # 3. Fallback for single flat messages
+    journey_ref = None
+    stop_code = None
+    delay_seconds = 0
+    is_cancelled = False
+    expected_time = None
+    scheduled_time = None
 
     for element in root.iter():
         tag = strip_namespace(element.tag)
@@ -330,13 +473,6 @@ def parse_infoplus_message(raw_bytes: bytes, envelope: str) -> List[DelayRecord]
                 if any(tok in lowered for tok in cancel_tokens):
                     is_cancelled = True
 
-        for value in values:
-            lowered = value.lower()
-            if lowered.isdigit() and int(lowered) in infoplus_cancel_codes:
-                is_cancelled = True
-            if any(tok in lowered for tok in cancel_tokens):
-                is_cancelled = True
-
         for attr_name, attr_value in element.attrib.items():
             attr_tag = strip_namespace(attr_name)
             attr_value = attr_value.strip()
@@ -361,11 +497,12 @@ def parse_infoplus_message(raw_bytes: bytes, envelope: str) -> List[DelayRecord]
                 if parsed_dt is not None and scheduled_time is None:
                     scheduled_time = parsed_dt
 
-            lowered = attr_value.lower()
-            if lowered.isdigit() and int(lowered) in infoplus_cancel_codes:
-                is_cancelled = True
-            if any(tok in lowered for tok in cancel_tokens):
-                is_cancelled = True
+            if attr_tag in status_tags:
+                lowered = attr_value.lower()
+                if lowered.isdigit() and int(lowered) in infoplus_cancel_codes:
+                    is_cancelled = True
+                if any(tok in lowered for tok in cancel_tokens):
+                    is_cancelled = True
 
     if expected_time is None and scheduled_time is not None:
         if delay_seconds != 0:
@@ -374,6 +511,11 @@ def parse_infoplus_message(raw_bytes: bytes, envelope: str) -> List[DelayRecord]
             expected_time = format_datetime_value(scheduled_time)
 
     if journey_ref and stop_code:
+        if expected_time and not is_cancelled:
+            p_exp = parse_datetime_value(expected_time)
+            if p_exp and p_exp < stale_cutoff:
+                return records
+
         records.append(DelayRecord(
             journey_ref=journey_ref,
             stop_code=stop_code,
@@ -488,12 +630,21 @@ def parse_kv78_message(payload: str, envelope: str) -> List[DelayRecord]:
     def parse_passtime(row: Dict[str, str]):
         row = normalize_row(row)
         data_owner = row_value(row, ['DataOwnerCode', 'DataOwner'])
-        journey_num = row_value(row, ['JourneyNumber', 'LinePlanningNumber', 'LocalServiceLevelCode'])
+        line_num = row_value(row, ['LinePlanningNumber', 'LineNumber', 'Line'])
+        journey_num = row_value(row, ['JourneyNumber', 'LocalServiceLevelCode'])
         user_stop = row_value(row, ['UserStopCode', 'TimingPointCode', 'StopCode'])
         status = row_value(row, ['TripStopStatus', 'PasstimeEffect', 'Status']).upper()
 
         if not user_stop or not journey_num:
             return
+
+        journey_num = str(journey_num).strip()
+        if journey_num.isdigit():
+            journey_num = str(int(journey_num))
+
+        line_num = str(line_num).strip() if line_num else ""
+        if line_num.isdigit():
+            line_num = str(int(line_num))
 
         target_dep = row_value(row, ['TargetDepartureTime', 'TargetArrivalTime'])
         expected_dep = row_value(row, ['ExpectedDepartureTime', 'ExpectedArrivalTime'])
@@ -509,12 +660,16 @@ def parse_kv78_message(payload: str, envelope: str) -> List[DelayRecord]:
                     delay_seconds -= 86400
 
         is_cancelled = any(token in status for token in ('CANCEL', 'CANCELLED', 'DELETED', 'NOTDRIVING', 'VERVALLEN', 'RIJDETNIET'))
-        journey_ref = f"{data_owner}:{journey_num}" if data_owner else journey_num
+
+        refs = []
+        if data_owner and line_num and journey_num:
+            refs.append(f"{data_owner}:{line_num}:{journey_num}")
+        elif data_owner and journey_num:
+            refs.append(f"{data_owner}:{journey_num}")
+        elif journey_num:
+            refs.append(str(journey_num))
 
         now_iso = datetime.now(timezone.utc).isoformat()
-        refs = [journey_ref]
-        if data_owner and journey_num and journey_num != journey_ref:
-            refs.append(journey_num)
 
         stops = [user_stop]
         if user_stop.isdigit():
@@ -557,16 +712,16 @@ def parse_kv78_message(payload: str, envelope: str) -> List[DelayRecord]:
         line = raw_line.strip()
         if not line:
             continue
-        if line.startswith('\\T'):
-            current_table = line[2:].split('|', 1)[0].strip().upper()
+        if line.startswith('\\T') or line.startswith('/T'):
+            current_table = line[2:].lstrip('=| ').split('|', 1)[0].strip().upper()
             continue
-        if line.startswith('\\L'):
-            header_text = line[2:]
+        if line.startswith('\\L') or line.startswith('/L'):
+            header_text = line[2:].lstrip('=| ')
             if header_text.endswith('CRLF'):
                 header_text = header_text[:-4]
-            headers = [h.strip() for h in header_text.split('|')]
+            headers = [h.strip().lstrip('=') for h in header_text.split('|')]
             continue
-        if (current_table.endswith('PASSTIME') or current_table in ('DATEDPASSTIME', 'LOCALSERVICEGROUPPASSTIME', 'PASSTIME')) and not line.startswith('\\'):
+        if (current_table.endswith('PASSTIME') or current_table in ('DATEDPASSTIME', 'LOCALSERVICEGROUPPASSTIME', 'PASSTIME')) and not (line.startswith('\\') or line.startswith('/')):
             values = [v.strip() for v in line.split('|')]
             if values and values[-1].endswith('CRLF'):
                 values[-1] = values[-1][:-4].strip()

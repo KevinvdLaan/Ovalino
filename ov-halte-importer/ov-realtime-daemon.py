@@ -7,7 +7,7 @@ Consumes ZeroMQ feeds from NDOVloket.nl:
   - InfoPlus DVS (Trains): tcp://pubsub.besteffort.ndovloket.nl:7664
 
 Updates `wp_ovhi_realtime_delays` in WordPress database.
-Deletes records older than 1 hour.
+Deletes records older than 2 hours.
 """
 
 import sys
@@ -53,8 +53,8 @@ class AmsterdamTZ(tzinfo):
 AMSTERDAM_TZ = AmsterdamTZ()
 
 
-def parse_and_format_datetime(raw_val, add_delay_seconds=0):
-    """Parse an ISO 8601 string or time string into Europe/Amsterdam 'YYYY-MM-DD HH:MM:SS'."""
+def parse_and_format_datetime(raw_val, add_delay_seconds=0, service_date=None):
+    """Parse a feed timestamp into Europe/Amsterdam 'YYYY-MM-DD HH:MM:SS'."""
     if not raw_val:
         return None
     val = str(raw_val).strip()
@@ -78,11 +78,22 @@ def parse_and_format_datetime(raw_val, add_delay_seconds=0):
         # Check HH:MM or HH:MM:SS
         m = re.match(r'^(\d{1,2}):(\d{2})(?::(\d{2}))?$', val)
         if m:
-            now_local = datetime.now(AMSTERDAM_TZ)
             h = int(m.group(1))
             mi = int(m.group(2))
             s = int(m.group(3) or 0)
-            dt_local = now_local.replace(hour=h, minute=mi, second=s, microsecond=0)
+            base_date = None
+            if service_date:
+                try:
+                    base_date = datetime.strptime(str(service_date)[:10], '%Y-%m-%d').replace(tzinfo=AMSTERDAM_TZ)
+                except ValueError:
+                    base_date = None
+            if base_date is None:
+                base_date = datetime.now(AMSTERDAM_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+            dt_local = base_date.replace(hour=h, minute=mi, second=s)
+            # TreinDatum is the operational day. Times before 05:00 belong
+            # to the following calendar date of that operational day.
+            if service_date and h < 5:
+                dt_local += timedelta(days=1)
             if add_delay_seconds:
                 dt_local += timedelta(seconds=add_delay_seconds)
             return dt_local.strftime('%Y-%m-%d %H:%M:%S')
@@ -367,7 +378,7 @@ class DelayDatabase:
         except Exception:
             self.connect()
 
-    def upsert_delay(self, journey_ref, stop_code, delay_seconds, is_cancelled, expected_time=None, service_date=None, change_type=0, is_extra_train=False):
+    def upsert_delay(self, journey_ref, stop_code, delay_seconds, is_cancelled, expected_time=None, service_date=None, change_type=0, is_extra_train=False, arrival_cancelled=None, departure_cancelled=None, planned_platform=None, actual_platform=None, platform_changed=False, route_display=''):
         """Insert or update delay record.
 
         expected_time should be a string in 'YYYY-MM-DD HH:MM:SS' format or None.
@@ -383,8 +394,8 @@ class DelayDatabase:
             try:
                 cursor = self.conn.cursor()
                 sql = f"""
-                    INSERT INTO {self.table_name} (journey_ref, stop_code, delay_seconds, is_cancelled, expected_time, service_date, change_type, is_extra_train, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    INSERT INTO {self.table_name} (journey_ref, stop_code, delay_seconds, is_cancelled, expected_time, service_date, change_type, is_extra_train, arrival_cancelled, departure_cancelled, planned_platform, actual_platform, platform_changed, route_display, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                     ON DUPLICATE KEY UPDATE
                         delay_seconds = VALUES(delay_seconds),
                         is_cancelled = VALUES(is_cancelled),
@@ -392,9 +403,15 @@ class DelayDatabase:
                         service_date = VALUES(service_date),
                         change_type = VALUES(change_type),
                         is_extra_train = VALUES(is_extra_train),
+                        arrival_cancelled = COALESCE(VALUES(arrival_cancelled), arrival_cancelled),
+                        departure_cancelled = COALESCE(VALUES(departure_cancelled), departure_cancelled),
+                        planned_platform = VALUES(planned_platform),
+                        actual_platform = VALUES(actual_platform),
+                        platform_changed = VALUES(platform_changed),
+                        route_display = COALESCE(NULLIF(VALUES(route_display), ''), route_display),
                         updated_at = NOW()
                 """
-                params = (journey_ref, stop_code, int(delay_seconds), 1 if is_cancelled else 0, expected_time, service_date, int(change_type or 0), 1 if is_extra_train else 0)
+                params = (journey_ref, stop_code, int(delay_seconds), 1 if is_cancelled else 0, expected_time, service_date, int(change_type or 0), 1 if is_extra_train else 0, None if arrival_cancelled is None else (1 if arrival_cancelled else 0), None if departure_cancelled is None else (1 if departure_cancelled else 0), planned_platform, actual_platform, 1 if platform_changed else 0, str(route_display or '')[:1000])
                 cursor.execute(sql, params)
                 cursor.close()
             except Exception as e:
@@ -402,33 +419,33 @@ class DelayDatabase:
                 try:
                     cursor = self.conn.cursor()
                     sql_fallback = f"""
-                        INSERT INTO {self.table_name} (journey_ref, stop_code, delay_seconds, is_cancelled, expected_time, updated_at)
-                        VALUES (%s, %s, %s, %s, %s, NOW())
+                        INSERT INTO {self.table_name} (journey_ref, stop_code, delay_seconds, is_cancelled, expected_time, service_date, change_type, is_extra_train, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
                         ON DUPLICATE KEY UPDATE
                             delay_seconds = VALUES(delay_seconds),
                             is_cancelled = VALUES(is_cancelled),
                             expected_time = VALUES(expected_time),
+                            service_date = VALUES(service_date),
+                            change_type = VALUES(change_type),
+                            is_extra_train = VALUES(is_extra_train),
                             updated_at = NOW()
                     """
-                    cursor.execute(sql_fallback, (journey_ref, stop_code, int(delay_seconds), 1 if is_cancelled else 0, expected_time))
+                    cursor.execute(sql_fallback, (journey_ref, stop_code, int(delay_seconds), 1 if is_cancelled else 0, expected_time, service_date, int(change_type or 0), 1 if is_extra_train else 0))
                     cursor.close()
                 except Exception as e2:
                     print(f"[DB Error] upsert failed: {e2}")
 
     def cleanup_old_records(self):
-        """Delete records older than 1 hour."""
+        """Delete records older than 2 hours."""
         with self.lock:
             self.ensure_connection()
             if not self.conn:
                 return
             try:
                 cursor = self.conn.cursor()
-                sql = f"DELETE FROM {self.table_name} WHERE updated_at < NOW() - INTERVAL 1 HOUR"
+                sql = f"DELETE FROM {self.table_name} WHERE updated_at < NOW() - INTERVAL 2 HOUR"
                 cursor.execute(sql)
-                deleted = cursor.rowcount
                 cursor.close()
-                if deleted > 0:
-                    print(f"[DB Cleanup] Removed {deleted} records older than 1 hour.")
             except Exception as e:
                 print(f"[DB Error] cleanup failed: {e}")
 
@@ -450,7 +467,7 @@ class DelayNormalizer:
         """Return a canonical key for grouping journey variants."""
         return str(journey_ref).strip()
 
-    def buffer_entry(self, journey_ref, stop_code, delay_seconds, is_cancelled, expected_time=None, service_date=None, change_type=0, is_extra_train=False, infoplus_structured=False):
+    def buffer_entry(self, journey_ref, stop_code, delay_seconds, is_cancelled, expected_time=None, service_date=None, change_type=0, is_extra_train=False, arrival_cancelled=None, departure_cancelled=None, planned_platform=None, actual_platform=None, platform_changed=False, infoplus_structured=False, route_display=''):
         if not journey_ref or not stop_code:
             return
         if not service_date:
@@ -464,6 +481,12 @@ class DelayNormalizer:
             'service_date': service_date,
             'change_type': int(change_type or 0),
             'is_extra_train': bool(is_extra_train),
+            'arrival_cancelled': arrival_cancelled,
+            'departure_cancelled': departure_cancelled,
+            'planned_platform': str(planned_platform).strip()[:8] if planned_platform else None,
+            'actual_platform': str(actual_platform).strip()[:8] if actual_platform else None,
+            'platform_changed': bool(platform_changed),
+            'route_display': str(route_display or '')[:1000],
             'infoplus_structured': bool(infoplus_structured)
         }
         key = self._canonical_journey_key(entry['journey_ref'])
@@ -488,7 +511,7 @@ class DelayNormalizer:
         # legacy cancellation-normalisation heuristic to these authoritative rows.
         if entries and all(e.get('infoplus_structured') for e in entries):
             for e in entries:
-                self.db.upsert_delay(e['journey_ref'], e['stop_code'], e['delay_seconds'], e['is_cancelled'], e['expected_time'], e.get('service_date'), e.get('change_type', 0), e.get('is_extra_train', False))
+                self.db.upsert_delay(e['journey_ref'], e['stop_code'], e['delay_seconds'], e['is_cancelled'], e['expected_time'], e.get('service_date'), e.get('change_type', 0), e.get('is_extra_train', False), e.get('arrival_cancelled'), e.get('departure_cancelled'), e.get('planned_platform'), e.get('actual_platform'), e.get('platform_changed', False), e.get('route_display', ''))
             return
 
         # Attempt to determine stop_order mapping from the timetable for this journey
@@ -862,14 +885,17 @@ class KV78Subscriber(threading.Thread):
             line = line.strip()
             if not line:
                 continue
-            if line.startswith("\\T"):
-                parts = line.split("\\")
-                if len(parts) >= 2:
-                    current_table = parts[1].strip()
-            elif line.startswith("\\L"):
-                headers = [h.strip() for h in line[2:].split("|")]
-            elif current_table in ("DATEDPASSTIME", "LOCALSERVICEGROUPPASSTIME") and not line.startswith("\\"):
+            if line.startswith("\\T") or line.startswith("/T"):
+                current_table = line[2:].lstrip('=| ').split('|', 1)[0].strip().upper()
+            elif line.startswith("\\L") or line.startswith("/L"):
+                header_text = line[2:].lstrip('=| ')
+                if header_text.endswith('CRLF'):
+                    header_text = header_text[:-4]
+                headers = [h.strip().lstrip('=') for h in header_text.split('|')]
+            elif (current_table.endswith("PASSTIME") or current_table in ("DATEDPASSTIME", "LOCALSERVICEGROUPPASSTIME", "PASSTIME")) and not (line.startswith("\\") or line.startswith("/")):
                 values = [v.strip() for v in line.split("|")]
+                if values and values[-1].endswith('CRLF'):
+                    values[-1] = values[-1][:-4].strip()
                 if len(values) == len(headers):
                     row = dict(zip(headers, values))
                     self.process_passtime(row)
@@ -979,6 +1005,23 @@ class KV78Subscriber(threading.Thread):
 
 class InfoPlusSubscriber(threading.Thread):
     """Subscriber thread for NS InfoPlus DVS train feed."""
+    INFO_PLUS_CANCELLATION_CODES = {25, 32, 39, 44}
+    INFO_PLUS_PRIORITY_ORDER = (62, 61, 64, 5, 67, 68, 69, 11)
+    INFO_PLUS_PRIORITY_BY_CHANGE_TYPE = {
+        25: 62,
+        32: 62,
+        39: 62,
+        44: 62,
+        21: 61,
+        36: 64,
+        33: 5,
+        37: 67,
+        24: 68,
+        38: 68,
+        23: 69,
+        11: 11,
+    }
+
     def __init__(self, endpoint, db, normalizer=None):
         super().__init__(daemon=True)
         self.endpoint = endpoint
@@ -986,7 +1029,7 @@ class InfoPlusSubscriber(threading.Thread):
         # Use shared DelayNormalizer if provided, otherwise create one for compatibility
         self.normalizer = normalizer if normalizer is not None else DelayNormalizer(db)
         # Attempt to load configured InfoPlus cancellation codes from the plugin
-        self.infoplus_cancel_codes = set((25, 32, 34, 39, 44))
+        self.infoplus_cancel_codes = set(self.INFO_PLUS_CANCELLATION_CODES)
         try:
             plugin_dir = os.path.dirname(__file__)
             codes_file = os.path.join(plugin_dir, 'infoplus_cancel_codes.json')
@@ -1002,7 +1045,7 @@ class InfoPlusSubscriber(threading.Thread):
                             except Exception:
                                 continue
                         if len(codes) > 0:
-                            self.infoplus_cancel_codes = codes
+                            self.infoplus_cancel_codes = codes.intersection(self.INFO_PLUS_CANCELLATION_CODES)
         except Exception:
             # ignore — fallback to built-in defaults
             pass
@@ -1036,17 +1079,38 @@ class InfoPlusSubscriber(threading.Thread):
             root = ET.fromstring(xml_content)
             # RitInfo is the authoritative, full train message. It contains
             # TreinDatum and station/ritdeel WijzigingType per stop.
-            for rit_info in find_elements_by_names(root, ['RitInfo']):
+            rit_infos = find_elements_by_names(root, ['RitInfo'])
+            for rit_info in rit_infos:
                 self.process_rit_info(rit_info)
+            if not rit_infos:
+                # DVS is a station-scoped update and often arrives before the
+                # full RitInfo. Use it as a fast fallback, never alongside a
+                # full message from the same XML payload.
+                for dvs in find_elements_by_names(root, ['DVS']):
+                    self.process_dvs(dvs)
         except Exception as exc:
             print(f"[InfoPlus Error] parse_xml failed: {exc}")
+
+    def prioritized_change_type(self, change_types):
+        changes = {int(code) for code in change_types if str(code).isdigit()}
+        if not changes:
+            return 0
+        priority_rank = {priority: rank for rank, priority in enumerate(self.INFO_PLUS_PRIORITY_ORDER)}
+        return min(
+            changes,
+            key=lambda code: (
+                priority_rank.get(self.INFO_PLUS_PRIORITY_BY_CHANGE_TYPE.get(code), len(priority_rank)),
+                code,
+            ),
+        )
 
     def process_rit_info(self, rit_info):
         """Process the documented RitInfo hierarchy without guessing statuses.
 
         InfoPlus identifies a service by TreinDatum + TreinNummer. Change type
-        24 means a separate Extra trein; 25 is a cancellation. Other change
-        types (notably 34, 36 and 37) are route/platform changes, never cancellations.
+        24/38 means a separate Extra trein.  A WT=25 may occur on the complete
+        run or on a logical run part.  An explicit station-level <Stopt> value
+        is therefore authoritative over an inherited WT=25.
         """
         train_num = find_text_any(rit_info, ['TreinNummer', 'RitNummer', 'LogischeRitNummer', 'Trein', 'JourneyRef'])
         train_date = find_text_any(rit_info, ['TreinDatum', 'Treindatum'])
@@ -1054,6 +1118,7 @@ class InfoPlusSubscriber(threading.Thread):
             return
         train_num = str(int(train_num)) if train_num.strip().isdigit() else train_num.strip()
         train_date = train_date[:10] if train_date else compute_service_date()
+        route_display = find_text_any(rit_info, ['PresentatieVerkorteRouteHerkomst'])[:1000]
 
         def direct_change_types(element):
             values = []
@@ -1065,8 +1130,11 @@ class InfoPlusSubscriber(threading.Thread):
                     values.append(int(value.strip()))
             return values
 
-        def walk(element, inherited_types):
-            change_types = inherited_types + direct_change_types(element)
+        def walk(element, inherited_global_types):
+            elem_changes = direct_change_types(element)
+            # Only global train-level types (WT=24 extra trein, WT=25 vervallen trein) are inherited
+            global_changes = inherited_global_types + [c for c in elem_changes if c in (24, 25, 38)]
+
             if strip_namespace(element.tag).lower() == 'logischeritdeelstation':
                 station_code = find_text_any(element, ['StationCode'])
                 if station_code:
@@ -1077,16 +1145,87 @@ class InfoPlusSubscriber(threading.Thread):
                     else:
                         station_code = station_code.lower()
 
-                    departure_time = find_text_any(element, ['ActueleVertrekTijd', 'GeplandeVertrekTijd', 'VertrekTijd', 'KorteVertrekTijd'])
-                    arrival_time = find_text_any(element, ['ActueleAankomstTijd', 'GeplandeAankomstTijd', 'AankomstTijd', 'KorteAankomstTijd'])
-                    delay_value = find_text_any(element, ['ExacteVertrekVertraging', 'PresentatieVertrekVertraging', 'GedempteVertrekVertraging', 'ExacteAankomstVertraging', 'PresentatieAankomstVertraging', 'GedempteAankomstVertraging', 'VertrekVertraging', 'AankomstVertraging', 'Vertraging'])
+                    actual_departure_time = find_text_any(element, ['ActueleVertrekTijd'])
+                    actual_arrival_time = find_text_any(element, ['ActueleAankomstTijd'])
+                    departure_time = actual_departure_time or find_text_any(element, ['GeplandeVertrekTijd', 'VertrekTijd', 'KorteVertrekTijd'])
+                    arrival_time = actual_arrival_time or find_text_any(element, ['GeplandeAankomstTijd', 'AankomstTijd', 'KorteAankomstTijd'])
+
+                    # Primary delay per station: departure delay when departing, arrival delay when terminating
+                    if departure_time:
+                        delay_value = find_text_any(element, ['ExacteVertrekVertraging', 'PresentatieVertrekVertraging', 'GedempteVertrekVertraging', 'VertrekVertraging', 'Vertraging'])
+                    else:
+                        delay_value = find_text_any(element, ['ExacteAankomstVertraging', 'PresentatieAankomstVertraging', 'GedempteAankomstVertraging', 'AankomstVertraging', 'Vertraging'])
                     delay_sec = parse_iso_duration(delay_value)
 
-                    is_extra = 24 in change_types
-                    is_cancelled = (25 in change_types) or any(c in self.infoplus_cancel_codes for c in change_types if c != 34)
-                    change_type = 24 if is_extra else (25 if is_cancelled else (change_types[0] if change_types else 0))
+                    # Cancellation detection according to InfoPlus specification
+                    stopt_val = find_text_any(element, ['Stopt']).strip().upper()
+                    station_stops_no = stopt_val in ('N', 'NEE', 'FALSE', '0')
+                    station_has_cancel = 25 in self.infoplus_cancel_codes and 25 in elem_changes
+                    # WT=25 at run level must not be projected onto every station.
+                    # Only explicit station-level Stopt/WT events cancel an event;
+                    # a missing Stopt value is unknown, not Stopt=N.
+                    arrival_cancelled = station_stops_no or station_has_cancel or (39 in self.infoplus_cancel_codes and 39 in elem_changes) or (44 in self.infoplus_cancel_codes and 44 in elem_changes)
+                    departure_cancelled = station_stops_no or station_has_cancel or (32 in self.infoplus_cancel_codes and 32 in elem_changes) or (44 in self.infoplus_cancel_codes and 44 in elem_changes)
+                    is_cancelled = departure_cancelled
 
-                    exp_time = parse_and_format_datetime(departure_time or arrival_time, delay_sec if ('geplande' in (departure_time or arrival_time or '').lower() or 'korte' in (departure_time or arrival_time or '').lower()) else 0)
+                    is_extra = any(code in global_changes for code in (24, 38)) or any(code in elem_changes for code in (24, 38))
+                    priority_changes = elem_changes + [code for code in global_changes if code in (24, 38)]
+                    if is_cancelled and not any(code in (25, 32, 39, 44) for code in priority_changes):
+                        priority_changes.append(25)
+                    change_type = self.prioritized_change_type(priority_changes)
+
+                    base_time_str = departure_time or arrival_time
+                    is_actual_time = bool(actual_departure_time) if departure_time else bool(actual_arrival_time)
+                    exp_time = parse_and_format_datetime(
+                        base_time_str,
+                        0 if is_actual_time else delay_sec,
+                        train_date,
+                    )
+
+                    # If this station stop was already completed more than 30 minutes in the past, do not buffer/upsert it
+                    if exp_time:
+                        try:
+                            exp_dt = datetime.strptime(exp_time, '%Y-%m-%d %H:%M:%S').replace(tzinfo=AMSTERDAM_TZ)
+                            now_dt = datetime.now(AMSTERDAM_TZ)
+                            if exp_dt < (now_dt - timedelta(minutes=30)):
+                                return
+                        except Exception:
+                            pass
+
+                    # Track / platform detection
+                    planned_spoor = None
+                    actual_spoor = None
+                    arrival_platform_event = any(code in elem_changes for code in (21, 23))
+                    spoor_elem_name = 'TreinAankomstSpoor' if arrival_platform_event or not departure_time else 'TreinVertrekSpoor'
+                    for child in list(element):
+                        c_tag = strip_namespace(child.tag).lower()
+                        if c_tag in (spoor_elem_name.lower(), 'spoor'):
+                            info_stat = (child.attrib.get('InfoStatus') or '').lower()
+                            sp_num = find_text_any(child, ['SpoorNummer', 'spoornummer', 'spoor', 'Nummer'])
+                            sp_fase = find_text_any(child, ['Spoorfase', 'spoorfase', 'Fase', 'fase'])
+                            full_sp = ((sp_num or '') + (sp_fase or '')).strip()
+                            if not full_sp and child.text:
+                                full_sp = child.text.strip()
+                            if full_sp:
+                                if info_stat == 'actueel':
+                                    actual_spoor = full_sp[:8]
+                                elif info_stat == 'gepland':
+                                    planned_spoor = full_sp[:8]
+                                elif not planned_spoor:
+                                    planned_spoor = full_sp[:8]
+
+                    pres_spoor_name = 'PresentatieTreinAankomstSpoor' if arrival_platform_event or not departure_time else 'PresentatieTreinVertrekSpoor'
+                    pres_spoor = find_text_any(element, [pres_spoor_name])
+                    if pres_spoor and not actual_spoor and not planned_spoor:
+                        planned_spoor = pres_spoor.strip()[:8]
+
+                    platform_changed = 20 in elem_changes or 21 in elem_changes
+                    if 23 not in elem_changes and actual_spoor and planned_spoor and actual_spoor.lower() != planned_spoor.lower():
+                        platform_changed = True
+                    if arrival_platform_event and departure_time:
+                        planned_spoor = None
+                        actual_spoor = None
+                        platform_changed = False
 
                     target_train_num = train_num
                     if not is_extra:
@@ -1094,10 +1233,10 @@ class InfoPlusSubscriber(threading.Thread):
                         if base_train_num:
                             target_train_num = base_train_num
 
-                    self.normalizer.buffer_entry(target_train_num, station_code, delay_sec, is_cancelled, exp_time, service_date=train_date, change_type=change_type, is_extra_train=is_extra, infoplus_structured=True)
+                    self.normalizer.buffer_entry(target_train_num, station_code, delay_sec, is_cancelled, exp_time, service_date=train_date, change_type=change_type, is_extra_train=is_extra, arrival_cancelled=arrival_cancelled, departure_cancelled=departure_cancelled, planned_platform=planned_spoor, actual_platform=actual_spoor, platform_changed=platform_changed, infoplus_structured=True, route_display=route_display)
                 return
             for child in list(element):
-                walk(child, change_types)
+                walk(child, global_changes)
 
         # Preserve change types declared at RitInfo, LogischeRit and
         # LogischeRitDeel level for every station below that level.
@@ -1132,30 +1271,73 @@ class InfoPlusSubscriber(threading.Thread):
                 train_num = str(int(train_num))
 
             status_text = find_text_any(trein, ['WijzigingType', 'RitStatus', 'RitStopStatus', 'InfoStatus']).upper().strip()
-            is_cancelled = False
-            try:
-                if status_text.isdigit():
-                    code = int(status_text)
-                    if code == 25 or (code in self.infoplus_cancel_codes and code != 34):
-                        is_cancelled = True
-            except Exception:
-                pass
+            change_code = int(status_text) if status_text.isdigit() else 0
+            arrival_cancelled = change_code in self.infoplus_cancel_codes and change_code in (25, 39, 44)
+            departure_cancelled = change_code in self.infoplus_cancel_codes and change_code in (25, 32, 44)
+            is_cancelled = departure_cancelled
 
             cancel_statuses = ('CANCEL', 'CANCELLED', 'VERVALLEN', 'GEANNULEERD', 'RIJDETNIET', 'NOTDRIVING', 'DELETED')
             if status_text in cancel_statuses:
                 is_cancelled = True
+                arrival_cancelled = True
+                departure_cancelled = True
 
             delay_seconds = 0
             delay_elem = find_text_any(trein, ['ExacteVertrekVertraging', 'PresentatieVertrekVertraging', 'GedempteVertrekVertraging', 'ExacteAankomstVertraging', 'PresentatieAankomstVertraging', 'GedempteAankomstVertraging', 'VertrekVertraging', 'AankomstVertraging', 'Vertraging'])
             if delay_elem:
                 delay_seconds = parse_iso_duration(delay_elem)
 
-            dep_time_raw = find_text_any(trein, ['ActueleVertrekTijd', 'GeplandeVertrekTijd', 'VertrekTijd', 'KorteVertrekTijd'])
-            arr_time_raw = find_text_any(trein, ['ActueleAankomstTijd', 'GeplandeAankomstTijd', 'AankomstTijd', 'KorteAankomstTijd'])
+            actual_dep_time = find_text_any(trein, ['ActueleVertrekTijd'])
+            actual_arr_time = find_text_any(trein, ['ActueleAankomstTijd'])
+            dep_time_raw = actual_dep_time or find_text_any(trein, ['GeplandeVertrekTijd', 'VertrekTijd', 'KorteVertrekTijd'])
+            arr_time_raw = actual_arr_time or find_text_any(trein, ['GeplandeAankomstTijd', 'AankomstTijd', 'KorteAankomstTijd'])
             time_raw = dep_time_raw if dep_time_raw else arr_time_raw
-            expected_time = parse_and_format_datetime(time_raw, delay_seconds if time_raw and ('geplande' in time_raw.lower() or 'korte' in time_raw.lower()) else 0)
+            is_actual_time = bool(actual_dep_time) if dep_time_raw else bool(actual_arr_time)
+            expected_time = parse_and_format_datetime(time_raw, 0 if is_actual_time else delay_seconds)
 
-            self.normalizer.buffer_entry(train_num, station_code, delay_seconds, is_cancelled, expected_time, infoplus_structured=True)
+            if expected_time:
+                try:
+                    exp_dt = datetime.strptime(expected_time, '%Y-%m-%d %H:%M:%S').replace(tzinfo=AMSTERDAM_TZ)
+                    now_dt = datetime.now(AMSTERDAM_TZ)
+                    if exp_dt < (now_dt - timedelta(minutes=30)):
+                        continue
+                except Exception:
+                    pass
+
+            # Track / platform detection in DVS
+            planned_spoor = None
+            actual_spoor = None
+            for child in list(trein):
+                c_tag = strip_namespace(child.tag).lower()
+                if c_tag in ('treinvertrekspoor', 'treinaankomstspoor', 'spoor'):
+                    info_stat = (child.attrib.get('InfoStatus') or '').lower()
+                    sp_num = find_text_any(child, ['SpoorNummer', 'spoornummer', 'spoor', 'Nummer'])
+                    sp_fase = find_text_any(child, ['Spoorfase', 'spoorfase', 'Fase', 'fase'])
+                    full_sp = ((sp_num or '') + (sp_fase or '')).strip()
+                    if not full_sp and child.text:
+                        full_sp = child.text.strip()
+                    if full_sp:
+                        if info_stat == 'actueel':
+                            actual_spoor = full_sp[:8]
+                        elif info_stat == 'gepland':
+                            planned_spoor = full_sp[:8]
+                        elif not planned_spoor:
+                            planned_spoor = full_sp[:8]
+
+            pres_spoor = find_text_any(trein, ['PresentatieTreinVertrekSpoor', 'PresentatieTreinAankomstSpoor', 'Spoor'])
+            if pres_spoor and not actual_spoor and not planned_spoor:
+                planned_spoor = pres_spoor.strip()[:8]
+
+            platform_changed = False
+            try:
+                if status_text.isdigit() and int(status_text) in (20, 21):
+                    platform_changed = True
+            except Exception:
+                pass
+            if actual_spoor and planned_spoor and actual_spoor.lower() != planned_spoor.lower():
+                platform_changed = True
+
+            self.normalizer.buffer_entry(train_num, station_code, delay_seconds, is_cancelled, expected_time, change_type=change_code, arrival_cancelled=arrival_cancelled, departure_cancelled=departure_cancelled, planned_platform=planned_spoor, actual_platform=actual_spoor, platform_changed=platform_changed, infoplus_structured=True)
 
 
 def main():

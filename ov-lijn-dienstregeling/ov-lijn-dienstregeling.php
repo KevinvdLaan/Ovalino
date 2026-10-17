@@ -2,7 +2,7 @@
 /**
  * Plugin Name: OV Lijn Dienstregeling
  * Description: Toon een busboekje per lijn op basis van de data uit OV Halte Importer.
- * Version: 1.2.1
+ * Version: 1.2.4
  * Author: Kevin van der Laan
  * License: GPL-2.0-or-later
  * Requires Plugins: ov-halte-importer
@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) {
 }
 
 class OV_Lijn_Dienstregeling {
-	const VERSION = '1.2.1';
+	const VERSION = '1.2.4';
 	const OPTION_HIDDEN_LINES = 'ovld_hidden_lines';
 	const NONCE_ACTION = 'ovld_save_settings';
 	const FRONTEND_STYLE = 'ovld-frontend';
@@ -756,7 +756,7 @@ class OV_Lijn_Dienstregeling {
 				$stop_codes[] = $stop['scheduled_stop_point_ref'];
 			}
 		}
-		$realtime_delay_map = self::get_realtime_delay_map($journey_refs, $stop_codes);
+		$realtime_delay_map = self::get_realtime_delay_map($journeys, $line_ref, $stop_codes);
 		$link_map = self::get_stop_page_links();
 		$valid_date_range = 'Geldig op: ' . date_i18n('d-m-Y', strtotime($service_date));
 		$route = self::route_label($stops, $primary_pattern_ref, $pattern_refs);
@@ -1101,35 +1101,57 @@ class OV_Lijn_Dienstregeling {
 			return array();
 		}
 
-		// Find the latest start date (from_date) among the active rows for this date
-		$max_from_date = '';
-		foreach ($active_rows as $row) {
-			if ($row['from_date'] > $max_from_date) {
-				$max_from_date = $row['from_date'];
-			}
-		}
-
-		// Only keep rows that belong to the dataset with this latest start date
-		if ($max_from_date !== '') {
-			$active_rows = array_values(array_filter($active_rows, function ($row) use ($max_from_date) {
-				return $row['from_date'] === $max_from_date;
-			}));
-		}
-
-		// Filter duplicates: keep only the newest version of journeys with the same departure time
+		// Deduplicate journeys across overlapping datasets:
+		// - If journey_number is present and matches, they represent the same service journey across datasets.
+		// - If two journeys share the same departure time, they are duplicates unless both have distinct, non-empty journey numbers (e.g. regular bus vs reinforcement bus).
+		// - For each duplicate group, the newest version (highest from_date) is retained.
 		$groups = array();
 		foreach ($active_rows as $row) {
 			$dep = (int) $row['departure_seconds'];
-			$groups[$dep][] = $row;
+			$j_num = isset($row['journey_number']) ? trim((string) $row['journey_number']) : '';
+			if ($j_num === '' && !empty($row['journey_ref'])) {
+				$parts = explode(':', (string) $row['journey_ref']);
+				$last = end($parts);
+				$subparts = explode('-', $last);
+				if (count($subparts) >= 2) {
+					$j_num = $subparts[count($subparts) - 2];
+				}
+			}
+			$j_norm = ctype_digit($j_num) ? (string) (int) $j_num : $j_num;
+			$row['_j_norm'] = $j_norm;
+			$row['_dep'] = $dep;
+
+			$matched_group_idx = null;
+			foreach ($groups as $idx => $group) {
+				foreach ($group as $existing) {
+					$same_num = ($j_norm !== '' && $j_norm === $existing['_j_norm']);
+					$same_dep = ($dep === $existing['_dep']);
+					$distinct_nums = ($j_norm !== '' && $existing['_j_norm'] !== '' && $j_norm !== $existing['_j_norm']);
+
+					if ($same_num || ($same_dep && !$distinct_nums)) {
+						$matched_group_idx = $idx;
+						break 2;
+					}
+				}
+			}
+
+			if ($matched_group_idx !== null) {
+				$groups[$matched_group_idx][] = $row;
+			} else {
+				$groups[] = array($row);
+			}
 		}
+
 		$active_rows = array();
-		foreach ($groups as $dep => $group) {
+		foreach ($groups as $group) {
 			if (count($group) > 1) {
 				usort($group, function ($a, $b) {
 					return strcmp($b['from_date'], $a['from_date']);
 				});
 			}
-			$active_rows[] = $group[0];
+			$selected = $group[0];
+			unset($selected['_j_norm'], $selected['_dep']);
+			$active_rows[] = $selected;
 		}
 
 		// Initialise footnote field to empty string.
@@ -1165,16 +1187,13 @@ class OV_Lijn_Dienstregeling {
 		return $active_rows;
 	}
 
-	private static function get_realtime_delay_map(array $journey_refs, array $stop_codes) {
+	private static function get_realtime_delay_map(array $journeys, $line_ref, array $stop_codes) {
 		global $wpdb;
 
-		$journey_refs = array_values(array_filter(array_map('trim', $journey_refs), function ($value) {
-			return $value !== '';
-		}));
 		$stop_codes = array_values(array_filter(array_map('trim', $stop_codes), function ($value) {
 			return $value !== '';
 		}));
-		if (empty($journey_refs) || empty($stop_codes)) {
+		if (empty($journeys) || empty($stop_codes)) {
 			return array();
 		}
 
@@ -1189,10 +1208,52 @@ class OV_Lijn_Dienstregeling {
 		}
 		$lookup_stop_codes = array_values(array_unique($lookup_stop_codes));
 
+		// Vervoerdercode zit als 2e segment in line_ref (bv. "NL:EBS:Line:4247" -> "EBS"),
+		// en komt overeen met de DataOwnerCode uit de KV78turbo-feed. Het LinePlanningNumber
+		// (LAATSTE segment van line_ref, bv. "4247"/"b510") is - gecontroleerd tegen de
+		// EBS/Qbuzz NeTEx-bronbestanden - hetzelfde veld/dezelfde waarde als "LinePlanningNumber"
+		// in de live KV78turbo-feed, en staat ook letterlijk als leidend segment in de
+		// ServiceJourney-id (bv. "NL:EBS:ServiceJourney:4247-86873-17840682"). Let op: dit is
+		// NIET hetzelfde als het PublicCode-veld (bv. "247") - die twee lopen uiteen.
+		$line_parts = explode(':', (string) $line_ref);
+		$operator = isset($line_parts[1]) ? $line_parts[1] : '';
+		$line_planning_number = trim((string) end($line_parts));
+
 		$lookup_journey_refs = array();
 		$scheduled_refs_by_lookup = array();
-		foreach ($journey_refs as $journey_ref) {
-			foreach (self::get_realtime_journey_ref_candidates($journey_ref) as $candidate) {
+		foreach ($journeys as $journey) {
+			$journey_ref = isset($journey['journey_ref']) ? trim((string) $journey['journey_ref']) : '';
+			if ($journey_ref === '') {
+				continue;
+			}
+
+			// Lijn-gekwalificeerde kandidaat: "<OPERATOR>:<LINEPLANNINGNUMBER>:<RITNUMMER>".
+			// Zodra deze te bepalen is, matchen we UITSLUITEND hierop (plus de letterlijke,
+			// altijd-exacte journey_ref zelf) - bewust geen fallback meer naar het kale/
+			// ambigue ritnummer, want dat was precies de bron van foutieve matches tussen
+			// lijnen die toevallig hetzelfde ritnummer gebruiken.
+			$journey_number = isset($journey['journey_number']) ? trim((string) $journey['journey_number']) : '';
+			if ($journey_number === '' && !empty($journey_ref)) {
+				$parts = explode(':', $journey_ref);
+				$last = end($parts);
+				$subparts = explode('-', $last);
+				if (count($subparts) >= 2) {
+					$journey_number = $subparts[count($subparts) - 2];
+				}
+			}
+
+			if ($operator !== '' && $line_planning_number !== '' && $journey_number !== '') {
+				$j_norm = ctype_digit($journey_number) ? strval(intval($journey_number)) : $journey_number;
+				$l_norm = ctype_digit($line_planning_number) ? strval(intval($line_planning_number)) : $line_planning_number;
+				$candidates = array($operator . ':' . $l_norm . ':' . $j_norm, $journey_ref);
+				if ($l_norm !== $line_planning_number || $j_norm !== $journey_number) {
+					$candidates[] = $operator . ':' . $line_planning_number . ':' . $journey_number;
+				}
+			} else {
+				$candidates = array($journey_ref);
+			}
+
+			foreach ($candidates as $candidate) {
 				$lookup_journey_refs[] = $candidate;
 				if (!isset($scheduled_refs_by_lookup[$candidate])) {
 					$scheduled_refs_by_lookup[$candidate] = array();
@@ -1201,6 +1262,9 @@ class OV_Lijn_Dienstregeling {
 			}
 		}
 		$lookup_journey_refs = array_values(array_unique($lookup_journey_refs));
+		if (empty($lookup_journey_refs)) {
+			return array();
+		}
 
 		$table = $wpdb->prefix . 'ovhi_realtime_delays';
 		if (!$wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $table))) {
@@ -1215,6 +1279,16 @@ class OV_Lijn_Dienstregeling {
 			'SELECT journey_ref, stop_code, delay_seconds, is_cancelled FROM ' . $table . ' WHERE journey_ref IN (' . $placeholders_j . ') AND stop_code IN (' . $placeholders_s . ')',
 			$params
 		), ARRAY_A);
+
+		// Verwerk lijn-gekwalificeerde treffers ("OPERATOR:LIJN:RITNUMMER", 2 dubbele
+		// punten) altijd als laatste, zodat die een eventuele minder betrouwbare
+		// treffer op alleen het (ambigue) ritnummer overschrijft in de map hieronder,
+		// in plaats van andersom.
+		usort($rows, function ($a, $b) {
+			$a_specificity = substr_count((string) $a['journey_ref'], ':');
+			$b_specificity = substr_count((string) $b['journey_ref'], ':');
+			return $a_specificity <=> $b_specificity;
+		});
 
 		$map = array();
 		foreach ($rows as $row) {
@@ -1242,25 +1316,8 @@ class OV_Lijn_Dienstregeling {
 		if ($journey_ref === '') {
 			return array();
 		}
-
-		$candidates = array($journey_ref);
-		$last_colon_part = $journey_ref;
-		if (strpos($journey_ref, ':') !== false) {
-			$parts = explode(':', $journey_ref);
-			$last_colon_part = end($parts);
-			if ($last_colon_part !== '') {
-				$candidates[] = $last_colon_part;
-			}
-		}
-
-		if (strpos($last_colon_part, '-') !== false) {
-			$parts = array_values(array_filter(explode('-', $last_colon_part), 'strlen'));
-			if (count($parts) >= 2) {
-				$candidates[] = $parts[count($parts) - 2];
-			}
-		}
-
-		return array_values(array_unique(array_filter($candidates, 'strlen')));
+		// Uitsluitend de exacte journey_ref zelf (nooit kaal ritnummer)
+		return array($journey_ref);
 	}
 
 	private static function get_realtime_delay_map_key($journey_ref, $stop_code) {

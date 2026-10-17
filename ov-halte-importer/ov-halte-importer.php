@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Ovalino OV Halte Importer
  * Description: Upload CHB-, PassengerStopAssignment- en NeTEx-bestanden en toon automatisch lijnen en bestemmingen per halte via shortcode.
- * Version: 1.5
+ * Version: 1.6
  * Author: Kevin van der Laan
  * License: GPL-2.0-or-later
  */
@@ -12,11 +12,11 @@ if (!defined('ABSPATH')) {
 }
 
 class OV_Halte_Importer {
-	const VERSION = '1.5';
+	const VERSION = '1.6';
 	const OPTION_IMPORT_INFO = 'ovhi_import_info';
 	const OPTION_LIVE_DELAY_SETTINGS = 'ovhi_live_delay_settings';
 	const OPTION_LIVE_DELAY_LAST_SYNC = 'ovhi_live_delay_last_sync';
-	const DELAY_RETENTION_SECONDS = 3600; // automatische cleanup voor realtime vertragingen
+	const DELAY_RETENTION_SECONDS = 7200; // automatische cleanup voor realtime vertragingen (2 uur)
 	const NONCE_ACTION = 'ovhi_upload_datasets';
 	const NONCE_REALTIME_IMPORT = 'ovhi_realtime_import';
 	const NONCE_SAVE_LIVE_SETTINGS = 'ovhi_save_live_delay_settings';
@@ -204,6 +204,9 @@ class OV_Halte_Importer {
 			longitude decimal(9, 6) NOT NULL default 0,
 			wheelchair_access varchar(20) NOT NULL default 'unknown',
 			step_free_access varchar(20) NOT NULL default 'unknown',
+			shelter tinyint(1) NOT NULL default 0,
+			bicycle_parking tinyint(1) NOT NULL default 0,
+			toilet_available tinyint(1) NOT NULL default 0,
 			PRIMARY KEY  (quay_code),
 			KEY stopplace_code (stopplace_code)
 		) $charset;";
@@ -317,6 +320,12 @@ class OV_Halte_Importer {
 			service_date varchar(10) NULL default NULL,
 			change_type int(11) NOT NULL default 0,
 			is_extra_train tinyint(1) NOT NULL default 0,
+			arrival_cancelled tinyint(1) NULL default NULL,
+			departure_cancelled tinyint(1) NULL default NULL,
+			planned_platform varchar(8) NULL default NULL,
+			actual_platform varchar(8) NULL default NULL,
+			platform_changed tinyint(1) NOT NULL default 0,
+			route_display varchar(1000) NOT NULL default '',
 			updated_at datetime NOT NULL default CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 			PRIMARY KEY  (journey_ref, stop_code),
 			KEY stop_code (stop_code),
@@ -377,6 +386,15 @@ class OV_Halte_Importer {
 		if (!in_array('step_free_access', $column_names, true)) {
 			$wpdb->query("ALTER TABLE $table_quays ADD COLUMN step_free_access varchar(20) NOT NULL default 'unknown' AFTER wheelchair_access");
 		}
+		if (!in_array('shelter', $column_names, true)) {
+			$wpdb->query("ALTER TABLE $table_quays ADD COLUMN shelter tinyint(1) NOT NULL default 0 AFTER step_free_access");
+		}
+		if (!in_array('bicycle_parking', $column_names, true)) {
+			$wpdb->query("ALTER TABLE $table_quays ADD COLUMN bicycle_parking tinyint(1) NOT NULL default 0 AFTER shelter");
+		}
+		if (!in_array('toilet_available', $column_names, true)) {
+			$wpdb->query("ALTER TABLE $table_quays ADD COLUMN toilet_available tinyint(1) NOT NULL default 0 AFTER bicycle_parking");
+		}
 
 		// Migrate stop_offsets table indexes
 		$table_stop_offsets = self::table('stop_offsets');
@@ -413,7 +431,8 @@ class OV_Halte_Importer {
 			$wpdb->query("ALTER TABLE $table_lines ADD INDEX transport_mode (transport_mode)");
 		}
 
-		// Migrate realtime_delays table: add expected_time, service_date, change_type, is_extra_train columns if missing
+		// Migrate realtime_delays table: live train events keep separate arrival
+		// and departure cancellation states; WT=32 and WT=39 are not a whole-stop cancellation.
 		$table_realtime = self::table('realtime_delays');
 		$realtime_columns = $wpdb->get_results("DESCRIBE $table_realtime");
 		$realtime_column_names = wp_list_pluck($realtime_columns, 'Field');
@@ -429,6 +448,24 @@ class OV_Halte_Importer {
 		}
 		if (!in_array('is_extra_train', $realtime_column_names, true)) {
 			$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN is_extra_train tinyint(1) NOT NULL default 0 AFTER change_type");
+		}
+		if (!in_array('arrival_cancelled', $realtime_column_names, true)) {
+			$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN arrival_cancelled tinyint(1) NULL default NULL AFTER is_extra_train");
+		}
+		if (!in_array('departure_cancelled', $realtime_column_names, true)) {
+			$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN departure_cancelled tinyint(1) NULL default NULL AFTER arrival_cancelled");
+		}
+		if (!in_array('planned_platform', $realtime_column_names, true)) {
+			$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN planned_platform varchar(8) NULL default NULL AFTER is_extra_train");
+		}
+		if (!in_array('actual_platform', $realtime_column_names, true)) {
+			$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN actual_platform varchar(8) NULL default NULL AFTER planned_platform");
+		}
+		if (!in_array('platform_changed', $realtime_column_names, true)) {
+			$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN platform_changed tinyint(1) NOT NULL default 0 AFTER actual_platform");
+		}
+		if (!in_array('route_display', $realtime_column_names, true)) {
+			$wpdb->query("ALTER TABLE $table_realtime ADD COLUMN route_display varchar(1000) NOT NULL default '' AFTER platform_changed");
 		}
 	}
 
@@ -1156,6 +1193,73 @@ class OV_Halte_Importer {
 			}
 
 
+			$service_date = '';
+			$service_date_fields = array('service_date', 'serviceDate', 'treindatum', 'trein_datum', 'TreinDatum', 'operating_day', 'date');
+			$service_date_value = self::get_realtime_field_value($item, $service_date_fields);
+			if ($service_date_value !== null && trim((string) $service_date_value) !== '') {
+				$s_raw = trim((string) $service_date_value);
+				if (preg_match('/^\d{4}-\d{2}-\d{2}/', $s_raw, $m)) {
+					$service_date = $m[0];
+				}
+			}
+			if ($service_date === '' && $expected_time !== '') {
+				try {
+					$exp_dt = new DateTimeImmutable($expected_time, wp_timezone());
+					if ((int) $exp_dt->format('G') < 5) {
+						$exp_dt = $exp_dt->modify('-1 day');
+					}
+					$service_date = $exp_dt->format('Y-m-d');
+				} catch (Exception $e) {}
+			}
+			if ($service_date === '') {
+				$now_dt = new DateTimeImmutable('now', wp_timezone());
+				if ((int) $now_dt->format('G') < 5) {
+					$now_dt = $now_dt->modify('-1 day');
+				}
+				$service_date = $now_dt->format('Y-m-d');
+			}
+
+			$change_type = 0;
+			$change_type_fields = array('change_type', 'changeType', 'wijziging_type', 'wijzigingType', 'WijzigingType', 'wijziging');
+			$change_type_val = self::get_realtime_field_value($item, $change_type_fields);
+			if ($change_type_val !== null && is_numeric(trim((string) $change_type_val))) {
+				$change_type = (int) trim((string) $change_type_val);
+			}
+
+			$is_extra_train = 0;
+			$extra_train_fields = array('is_extra_train', 'isExtraTrain', 'extra_train', 'is_extra', 'isExtra');
+			$extra_train_val = self::get_realtime_field_value($item, $extra_train_fields);
+			if ($extra_train_val !== null) {
+				$is_extra_train = self::normalize_boolean_value($extra_train_val) ? 1 : 0;
+			} elseif (in_array($change_type, array(24, 38), true)) {
+				$is_extra_train = 1;
+			}
+
+			$planned_platform = '';
+			$planned_plat_fields = array('planned_platform', 'plannedPlatform', 'gepland_spoor', 'geplandSpoor', 'TreinVertrekSpoor');
+			$p_val = self::get_realtime_field_value($item, $planned_plat_fields);
+			if ($p_val !== null && trim((string) $p_val) !== '') {
+				$planned_platform = substr(trim((string) $p_val), 0, 8);
+			}
+
+			$actual_platform = '';
+			$actual_plat_fields = array('actual_platform', 'actualPlatform', 'actueel_spoor', 'actueelSpoor', 'platform', 'spoor', 'track');
+			$a_val = self::get_realtime_field_value($item, $actual_plat_fields);
+			if ($a_val !== null && trim((string) $a_val) !== '') {
+				$actual_platform = substr(trim((string) $a_val), 0, 8);
+			}
+
+			$platform_changed = 0;
+			$plat_changed_fields = array('platform_changed', 'platformChanged', 'spoorwijziging', 'is_spoorwijziging');
+			$pc_val = self::get_realtime_field_value($item, $plat_changed_fields);
+			if ($pc_val !== null) {
+				$platform_changed = self::normalize_boolean_value($pc_val) ? 1 : 0;
+			} elseif ($change_type === 20 || $change_type === 21) {
+				$platform_changed = 1;
+			} elseif ($change_type !== 23 && $actual_platform !== '' && $planned_platform !== '' && strtolower($actual_platform) !== strtolower($planned_platform)) {
+				$platform_changed = 1;
+			}
+
 			if ($journey_ref !== '' && $stop_code !== '') {
 				$alt_journey_refs = array($journey_ref);
 				if (strpos($journey_ref, ':') !== false) {
@@ -1165,7 +1269,6 @@ class OV_Halte_Importer {
 						$alt_journey_refs[] = $last_part;
 					}
 				}
-
 
 				$alt_stop_codes = array($stop_code);
 				if (preg_match('/^NL:Q:(\d+)$/i', $stop_code, $m)) {
@@ -1177,11 +1280,17 @@ class OV_Halte_Importer {
 				foreach ($alt_journey_refs as $j_ref) {
 					foreach ($alt_stop_codes as $s_code) {
 						$entries[] = array(
-							'journey_ref'   => $j_ref,
-							'stop_code'     => $s_code,
-							'delay_seconds' => $delay_seconds,
-							'is_cancelled'  => $is_cancelled ? 1 : 0,
-							'expected_time' => $expected_time,
+							'journey_ref'       => $j_ref,
+							'stop_code'         => $s_code,
+							'delay_seconds'     => $delay_seconds,
+							'is_cancelled'      => $is_cancelled ? 1 : 0,
+							'expected_time'     => $expected_time,
+							'service_date'      => $service_date,
+							'change_type'       => $change_type,
+							'is_extra_train'    => $is_extra_train,
+							'planned_platform'  => $planned_platform !== '' ? $planned_platform : null,
+							'actual_platform'   => $actual_platform !== '' ? $actual_platform : null,
+							'platform_changed'  => $platform_changed,
 						);
 					}
 				}
@@ -1300,7 +1409,8 @@ class OV_Halte_Importer {
 
 		$table = self::table('realtime_delays');
 		$result = $wpdb->query($wpdb->prepare(
-			'DELETE FROM ' . $table . ' WHERE updated_at < DATE_SUB(NOW(), INTERVAL %d SECOND)',
+			'DELETE FROM ' . $table . ' WHERE updated_at < DATE_SUB(NOW(), INTERVAL %d SECOND) OR (expected_time IS NOT NULL AND expected_time < DATE_SUB(NOW(), INTERVAL %d SECOND) AND is_cancelled = 0)',
+			self::DELAY_RETENTION_SECONDS,
 			self::DELAY_RETENTION_SECONDS
 		));
 		if ($result === false) {
@@ -1329,6 +1439,7 @@ class OV_Halte_Importer {
 			error_log('OVHI journey matching error: ' . $exception->getMessage());
 		}
 		$unique_rows = array();
+		$now_ts = time();
 		foreach ($rows as $row) {
 			$journey_ref = isset($row['journey_ref']) ? trim((string) $row['journey_ref']) : '';
 			$stop_code = isset($row['stop_code']) ? trim((string) $row['stop_code']) : '';
@@ -1336,6 +1447,13 @@ class OV_Halte_Importer {
 			$stop_code = substr($stop_code, 0, 100);
 			if ($journey_ref === '' || $stop_code === '') {
 				continue;
+			}
+			// Skip station stops that were already completed >30 minutes ago (except cancellations)
+			if (!empty($row['expected_time']) && empty($row['is_cancelled'])) {
+				$exp_ts = self::parse_expected_time_to_timestamp($row['expected_time']);
+				if ($exp_ts !== false && ($now_ts - $exp_ts) > 30 * MINUTE_IN_SECONDS) {
+					continue;
+				}
 			}
 			$row['journey_ref'] = $journey_ref;
 			$row['stop_code'] = $stop_code;
@@ -1363,6 +1481,18 @@ class OV_Halte_Importer {
 		}
 
 		foreach ($journey_indices as $journey_ref => $indices) {
+			// Sla ritten zonder uitval direct over om duizenden onnodige queries te voorkomen
+			$has_cancellation = false;
+			foreach ($indices as $idx) {
+				if (!empty($rows[$idx]['is_cancelled'])) {
+					$has_cancellation = true;
+					break;
+				}
+			}
+			if (!$has_cancellation) {
+				continue;
+			}
+
 			// Determine a reliable timetable mapping by trying candidate journey_refs
 			// (including short variants) and selecting the pattern with the best
 			// coverage of the stop_codes present in these rows. This avoids
@@ -1518,16 +1648,22 @@ class OV_Halte_Importer {
 			$values = array();
 			$queries = array();
 			foreach ($chunk as $row) {
-				// expected_time may be an empty string; use NULLIF in the VALUES list
-				$queries[] = "(%s, %s, %d, %d, NULLIF(%s, ''), NOW())";
+				// expected_time, service_date, planned_platform, actual_platform may be empty strings; use NULLIF in the VALUES list
+				$queries[] = "(%s, %s, %d, %d, NULLIF(%s, ''), NULLIF(%s, ''), %d, %d, NULLIF(%s, ''), NULLIF(%s, ''), %d, NOW())";
 				$values[] = isset($row['journey_ref']) ? $row['journey_ref'] : '';
 				$values[] = isset($row['stop_code']) ? $row['stop_code'] : '';
 				$values[] = isset($row['delay_seconds']) ? (int) $row['delay_seconds'] : 0;
 				$values[] = isset($row['is_cancelled']) ? (int) $row['is_cancelled'] : 0;
 				$values[] = isset($row['expected_time']) ? $row['expected_time'] : '';
+				$values[] = isset($row['service_date']) ? $row['service_date'] : '';
+				$values[] = isset($row['change_type']) ? (int) $row['change_type'] : 0;
+				$values[] = isset($row['is_extra_train']) ? (int) $row['is_extra_train'] : 0;
+				$values[] = isset($row['planned_platform']) && $row['planned_platform'] !== null ? $row['planned_platform'] : '';
+				$values[] = isset($row['actual_platform']) && $row['actual_platform'] !== null ? $row['actual_platform'] : '';
+				$values[] = isset($row['platform_changed']) ? (int) $row['platform_changed'] : 0;
 			}
 
-			$sql = 'INSERT INTO ' . $table . ' (journey_ref, stop_code, delay_seconds, is_cancelled, expected_time, updated_at) VALUES ' . implode(', ', $queries) . ' ON DUPLICATE KEY UPDATE delay_seconds = VALUES(delay_seconds), is_cancelled = VALUES(is_cancelled), expected_time = VALUES(expected_time), updated_at = NOW()';
+			$sql = 'INSERT INTO ' . $table . ' (journey_ref, stop_code, delay_seconds, is_cancelled, expected_time, service_date, change_type, is_extra_train, planned_platform, actual_platform, platform_changed, updated_at) VALUES ' . implode(', ', $queries) . ' ON DUPLICATE KEY UPDATE delay_seconds = VALUES(delay_seconds), is_cancelled = VALUES(is_cancelled), expected_time = VALUES(expected_time), service_date = VALUES(service_date), change_type = VALUES(change_type), is_extra_train = VALUES(is_extra_train), planned_platform = VALUES(planned_platform), actual_platform = VALUES(actual_platform), platform_changed = VALUES(platform_changed), updated_at = NOW()';
 			$result = $wpdb->query($wpdb->prepare($sql, $values));
 
 			if ($result === false) {
@@ -1549,20 +1685,38 @@ class OV_Halte_Importer {
 	 * @return array{0:string,1:string} array($operator, $journey_number) - beide
 	 *         kunnen leeg zijn als ze niet uit de ref zijn te halen.
 	 */
-	private static function split_realtime_operator_and_number($journey_ref) {
+	/**
+	 * Splitst een realtime journey_ref in operator, line_planning_number en journey_number.
+	 * Formaten:
+	 * - "OPERATOR:LINE:JOURNEY" (bv. "EBS:4301:1025" of "QBUZZ:b510:401")
+	 * - "OPERATOR:JOURNEY"      (bv. "EBS:1025" of "NS:1234")
+	 * - "JOURNEY"               (bv. "1025")
+	 *
+	 * @return array{operator:string, line:string, journey_number:string}
+	 */
+	private static function split_realtime_journey_ref($journey_ref) {
 		$journey_ref = trim((string) $journey_ref);
 		if ($journey_ref === '') {
-			return array('', '');
+			return array('operator' => '', 'line' => '', 'journey_number' => '');
 		}
 		if (strpos($journey_ref, ':') === false) {
-			// Kale vorm zonder vervoerdercode: kan niet veilig op lijn worden
-			// gefilterd, dus geen operator teruggeven (wordt hieronder overgeslagen).
-			return array('', $journey_ref);
+			return array('operator' => '', 'line' => '', 'journey_number' => $journey_ref);
 		}
 		$parts = explode(':', $journey_ref);
-		$number = trim((string) end($parts));
+		if (count($parts) >= 3) {
+			$operator = trim((string) $parts[0]);
+			$line = trim((string) $parts[1]);
+			$journey_number = trim((string) end($parts));
+			return array('operator' => $operator, 'line' => $line, 'journey_number' => $journey_number);
+		}
 		$operator = trim((string) $parts[0]);
-		return array($operator, $number);
+		$journey_number = trim((string) $parts[1]);
+		return array('operator' => $operator, 'line' => '', 'journey_number' => $journey_number);
+	}
+
+	private static function split_realtime_operator_and_number($journey_ref) {
+		$info = self::split_realtime_journey_ref($journey_ref);
+		return array($info['operator'], $info['journey_number']);
 	}
 
 	private static function add_scheduled_journey_delay_entries(array $rows) {
@@ -1581,24 +1735,37 @@ class OV_Halte_Importer {
 				continue;
 			}
 
-			list($operator, $journey_number) = self::split_realtime_operator_and_number($journey_ref);
+			$info = self::split_realtime_journey_ref($journey_ref);
+			$operator = $info['operator'];
+			$line = $info['line'];
+			$journey_number = $info['journey_number'];
+
 			if ($journey_number === '') {
 				continue;
 			}
-			if ($operator === '') {
-				// Zonder vervoerdercode kunnen we niet veilig op lijn filteren
-				// (ritnummers zijn niet vervoerder-breed uniek) - liever geen
-				// verrijkte match dan een verkeerde lijn koppelen.
+			if ($operator === '' || $line === '') {
+				// Zonder vervoerdercode of lijnnummer kunnen we niet veilig op lijn filteren
+				// (ritnummers zijn niet vervoerder-breed uniek). We matchen UITSLUITEND op
+				// de OPERATOR:LINE:JOURNEY variant - bewust NOOIT op een kaal ritnummer.
 				$skipped_no_operator++;
 				continue;
 			}
 
+			$j_num_norm = ctype_digit($journey_number) ? strval(intval($journey_number)) : $journey_number;
+			$line_norm = ($line !== '' && ctype_digit($line)) ? strval(intval($line)) : $line;
+
 			$operators[$operator] = true;
-			$journey_numbers[$journey_number] = true;
+			$journey_numbers[$j_num_norm] = true;
+			if ($journey_number !== $j_num_norm) {
+				$journey_numbers[$journey_number] = true;
+			}
 
 			foreach (self::get_realtime_stop_code_variants($stop_code) as $variant) {
 				$stop_codes[$variant] = true;
-				$rows_by_key[$operator . "\0" . $journey_number . "\0" . $variant] = $row;
+				$rows_by_key[$operator . "\0" . $line_norm . "\0" . $j_num_norm . "\0" . $variant] = $row;
+				if ($line !== $line_norm || $journey_number !== $j_num_norm) {
+					$rows_by_key[$operator . "\0" . $line . "\0" . $journey_number . "\0" . $variant] = $row;
+				}
 			}
 		}
 
@@ -1614,111 +1781,100 @@ class OV_Halte_Importer {
 		$journey_numbers = array_keys($journey_numbers);
 		$stop_codes = array_keys($stop_codes);
 
-		/*
-		 * Veiligheidsgrenzen: voorkom dat één synchronisatieronde onbegrensd
-		 * geheugen kan opeisen, ongeacht hoe groot de binnenkomende live-feed
-		 * is of hoeveel dienstregelingsregels er matchen. Zonder deze grenzen
-		 * kan de JOIN hieronder een combinatorische explosie van rijen
-		 * opleveren en PHP's memory_limit fataal doen vastlopen (zie
-		 * OVHI-incident 23/07).
-		 */
-		$max_journey_chunk_size = 100;
-		$max_stop_chunk_size = 200;
-		$max_rows_per_query = 5000;
-		$max_total_matches = 20000;
+		$max_journey_chunk_size = 50;
+		$max_rows_per_query = 1500;
+		$max_total_matches = 5000;
 
 		$journey_chunks = array_chunk($journey_numbers, $max_journey_chunk_size);
-		$stop_chunks = array_chunk($stop_codes, $max_stop_chunk_size);
 		$operator_placeholders = implode(',', array_fill(0, count($operators), '%s'));
 
+		$extra_rows = array();
 		$total_matches = 0;
 
 		foreach ($journey_chunks as $journey_chunk) {
-			foreach ($stop_chunks as $stop_chunk) {
-				if ($total_matches >= $max_total_matches) {
-					error_log('OVHI: matching-limiet van ' . $max_total_matches . ' bereikt, resterende combinaties overgeslagen om geheugenuitputting te voorkomen.');
-					break 2;
-				}
+			if ($total_matches >= $max_total_matches) {
+				error_log('OVHI: matching-limiet van ' . $max_total_matches . ' bereikt, resterende combinaties overgeslagen om geheugenuitputting te voorkomen.');
+				break;
+			}
 
-				$journey_placeholders = implode(',', array_fill(0, count($journey_chunk), '%s'));
-				$stop_placeholders = implode(',', array_fill(0, count($stop_chunk), '%s'));
+			$journey_placeholders = implode(',', array_fill(0, count($journey_chunk), '%s'));
 
-				/*
-				 * Matcht op het echte journey_number (uit het NeTEx
-				 * <PrivateCode type="JourneyNumber">-veld op ServiceJourney-
-				 * niveau - hetzelfde veld als "JourneyNumber" in de live
-				 * KV78turbo-feed) EN op de vervoerdercode die als 2e segment
-				 * in stop_offsets.line_ref staat (bv. "NL:EBS:Line:4509" ->
-				 * "EBS"). Ritnummers zijn alleen uniek per vervoerder+lijn,
-				 * dus zonder deze vervoerdersfilter matchte een journey_number
-				 * eerder ook rijen van compleet andere lijnen/vervoerders die
-				 * toevallig hetzelfde nummer gebruiken en langs dezelfde
-				 * (drukke) halte komen - dat gaf ten onrechte "rijdt niet" op
-				 * lijnen die gewoon reden.
-				 *
-				 * Voor rijen die (nog) geen journey_number hebben valt de
-				 * query terug op de oude heuristiek die de laatste twee
-				 * streepjes-delen uit het journey_ref/id haalt (klopt
-				 * toevallig voor Qbuzz's ID-opbouw ...:<blok>-<ritnr>-<variant>,
-				 * niet per se voor andere vervoerders) - de vervoerdersfilter
-				 * blijft in dat geval wel gelden.
-				 */
-				$query = '
-					SELECT DISTINCT
-						j.journey_ref,
-						st.user_stop_code,
-						COALESCE(NULLIF(j.journey_number, \'\'), SUBSTRING_INDEX(SUBSTRING_INDEX(SUBSTRING_INDEX(j.journey_ref, CHAR(58), -1), CHAR(45), -2), CHAR(45), 1)) AS journey_number,
-						SUBSTRING_INDEX(SUBSTRING_INDEX(so.line_ref, CHAR(58), 2), CHAR(58), -1) AS operator
-					FROM ' . self::table('journeys') . ' j
-					INNER JOIN ' . self::table('stop_offsets') . ' so
-						ON so.service_journey_pattern_ref = j.service_journey_pattern_ref
-						AND so.time_demand_type_ref = j.time_demand_type_ref
-					INNER JOIN ' . self::table('scheduled_stops') . ' st
-						ON st.scheduled_stop_point_ref = so.scheduled_stop_point_ref
-					WHERE COALESCE(NULLIF(j.journey_number, \'\'), SUBSTRING_INDEX(SUBSTRING_INDEX(SUBSTRING_INDEX(j.journey_ref, CHAR(58), -1), CHAR(45), -2), CHAR(45), 1)) IN (' . $journey_placeholders . ')
-						AND st.user_stop_code IN (' . $stop_placeholders . ')
-						AND SUBSTRING_INDEX(SUBSTRING_INDEX(so.line_ref, CHAR(58), 2), CHAR(58), -1) IN (' . $operator_placeholders . ')
-					LIMIT ' . (int) $max_rows_per_query;
+			/*
+			 * Matcht op het echte journey_number (uit het NeTEx
+			 * <PrivateCode type="JourneyNumber">-veld op ServiceJourney-
+			 * niveau - hetzelfde veld als "JourneyNumber" in de live
+			 * KV78turbo-feed) EN op de vervoerdercode die als 2e segment
+			 * in stop_offsets.line_ref staat (bv. "NL:EBS:Line:4509" ->
+			 * "EBS"), evenals het LinePlanningNumber (laatste segment).
+			 */
+			$query = '
+				SELECT DISTINCT
+					j.journey_ref,
+					st.user_stop_code,
+					COALESCE(NULLIF(j.journey_number, \'\'), SUBSTRING_INDEX(SUBSTRING_INDEX(SUBSTRING_INDEX(j.journey_ref, CHAR(58), -1), CHAR(45), -2), CHAR(45), 1)) AS journey_number,
+					SUBSTRING_INDEX(SUBSTRING_INDEX(so.line_ref, CHAR(58), 2), CHAR(58), -1) AS operator,
+					SUBSTRING_INDEX(so.line_ref, CHAR(58), -1) AS line_planning_number
+				FROM ' . self::table('journeys') . ' j
+				INNER JOIN ' . self::table('stop_offsets') . ' so
+					ON so.service_journey_pattern_ref = j.service_journey_pattern_ref
+					AND so.time_demand_type_ref = j.time_demand_type_ref
+				INNER JOIN ' . self::table('scheduled_stops') . ' st
+					ON st.scheduled_stop_point_ref = so.scheduled_stop_point_ref
+				WHERE COALESCE(NULLIF(j.journey_number, \'\'), SUBSTRING_INDEX(SUBSTRING_INDEX(SUBSTRING_INDEX(j.journey_ref, CHAR(58), -1), CHAR(45), -2), CHAR(45), 1)) IN (' . $journey_placeholders . ')
+					AND SUBSTRING_INDEX(SUBSTRING_INDEX(so.line_ref, CHAR(58), 2), CHAR(58), -1) IN (' . $operator_placeholders . ')
+				LIMIT ' . (int) $max_rows_per_query;
 
-				$params = array_merge($journey_chunk, $stop_chunk, $operators);
-				$matches = $wpdb->get_results($wpdb->prepare($query, $params), ARRAY_A);
+			$params = array_merge($journey_chunk, $operators);
+			$matches = $wpdb->get_results($wpdb->prepare($query, $params), ARRAY_A);
 
-				if ($matches === null) {
-					error_log('OVHI matching-query mislukt: ' . $wpdb->last_error);
+			if ($matches === null) {
+				error_log('OVHI matching-query mislukt: ' . $wpdb->last_error);
+				continue;
+			}
+
+			foreach ($matches as $match) {
+				$journey_number = isset($match['journey_number']) ? trim((string) $match['journey_number']) : '';
+				$operator = isset($match['operator']) ? trim((string) $match['operator']) : '';
+				$line_planning_number = isset($match['line_planning_number']) ? trim((string) $match['line_planning_number']) : '';
+				$stop_code = isset($match['user_stop_code']) ? trim((string) $match['user_stop_code']) : '';
+				if ($journey_number === '' || $operator === '' || $stop_code === '' || empty($match['journey_ref'])) {
 					continue;
 				}
 
-				if (count($matches) >= $max_rows_per_query) {
-					error_log('OVHI: matching-query raakte de LIMIT van ' . $max_rows_per_query . ' rijen voor dit segment; sommige matches kunnen ontbreken. Overweeg de matching verder te verfijnen als dit vaak voorkomt.');
+				$j_num_norm = ctype_digit($journey_number) ? strval(intval($journey_number)) : $journey_number;
+				$line_norm = ($line_planning_number !== '' && ctype_digit($line_planning_number)) ? strval(intval($line_planning_number)) : $line_planning_number;
+
+				$k_exact = $operator . "\0" . $line_norm . "\0" . $j_num_norm . "\0" . $stop_code;
+				$k_raw_line = $operator . "\0" . $line_planning_number . "\0" . $journey_number . "\0" . $stop_code;
+
+				$source = null;
+				if (isset($rows_by_key[$k_exact])) {
+					$source = $rows_by_key[$k_exact];
+				} elseif (isset($rows_by_key[$k_raw_line])) {
+					$source = $rows_by_key[$k_raw_line];
 				}
 
-				foreach ($matches as $match) {
-					$journey_number = isset($match['journey_number']) ? (string) $match['journey_number'] : '';
-					$operator = isset($match['operator']) ? (string) $match['operator'] : '';
-					$stop_code = isset($match['user_stop_code']) ? (string) $match['user_stop_code'] : '';
-					$key = $operator . "\0" . $journey_number . "\0" . $stop_code;
-					if ($journey_number === '' || $operator === '' || $stop_code === '' || empty($match['journey_ref']) || !isset($rows_by_key[$key])) {
-						continue;
-					}
-
-					$source = $rows_by_key[$key];
-					$source['journey_ref'] = (string) $match['journey_ref'];
-					$source['stop_code'] = $stop_code;
-					$rows[] = $source;
-
-					// The map uses the quay code from the API, while the stop timetable
-					// uses user_stop_code. Preserve both exact stop-code representations.
-					foreach (self::get_realtime_stop_code_variants(isset($rows_by_key[$key]['stop_code']) ? $rows_by_key[$key]['stop_code'] : '') as $source_stop_code) {
-						$source['stop_code'] = $source_stop_code;
-						$rows[] = $source;
-					}
-
-					$total_matches++;
+				if ($source === null) {
+					continue;
 				}
+
+				$source['journey_ref'] = (string) $match['journey_ref'];
+				$source['stop_code'] = $stop_code;
+				$extra_rows[] = $source;
+
+				// The map uses the quay code from the API, while the stop timetable
+				// uses user_stop_code. Preserve both exact stop-code representations.
+				foreach (self::get_realtime_stop_code_variants(isset($source['stop_code']) ? $source['stop_code'] : '') as $source_stop_code) {
+					$source['stop_code'] = $source_stop_code;
+					$extra_rows[] = $source;
+				}
+
+				$total_matches++;
 			}
+			unset($matches);
 		}
 
-		return $rows;
+		return array_merge($rows, $extra_rows);
 	}
 
 	private static function get_realtime_journey_number($journey_ref) {
@@ -1751,7 +1907,7 @@ class OV_Halte_Importer {
 	 * worden gekoppeld zodra beide hetzelfde ritnummer gebruiken en langs dezelfde
 	 * (drukke) halte komen.
 	 *
-	 * @return array{operator:string,line_planning_number:string,journey_number:string}|null
+	 * @return array{operator:string,line_planning_number:string,journey_number:string,raw_line_planning_number:string,raw_journey_number:string}|null
 	 */
 	private static function get_realtime_journey_context($journey_ref) {
 		static $cache = array();
@@ -1766,12 +1922,13 @@ class OV_Halte_Importer {
 
 		global $wpdb;
 		$query = '
-			SELECT j.journey_number, so.line_ref
+			SELECT COALESCE(NULLIF(j.journey_number, \'\'), SUBSTRING_INDEX(SUBSTRING_INDEX(SUBSTRING_INDEX(j.journey_ref, CHAR(58), -1), CHAR(45), -2), CHAR(45), 1)) AS journey_number,
+			       so.line_ref
 			FROM ' . self::table('journeys') . ' j
 			INNER JOIN ' . self::table('stop_offsets') . ' so
 				ON so.service_journey_pattern_ref = j.service_journey_pattern_ref
 				AND so.time_demand_type_ref = j.time_demand_type_ref
-			WHERE j.journey_ref = %s AND j.journey_number != \'\' AND so.line_ref != \'\'
+			WHERE j.journey_ref = %s AND so.line_ref != \'\'
 			LIMIT 1';
 		$row = $wpdb->get_row($wpdb->prepare($query, $journey_ref), ARRAY_A);
 
@@ -1780,11 +1937,16 @@ class OV_Halte_Importer {
 			$line_parts = explode(':', (string) $row['line_ref']);
 			$operator = isset($line_parts[1]) ? $line_parts[1] : '';
 			$line_planning_number = trim((string) end($line_parts));
+			$journey_number = trim((string) $row['journey_number']);
 			if ($operator !== '' && $line_planning_number !== '') {
+				$j_norm = ctype_digit($journey_number) ? strval(intval($journey_number)) : $journey_number;
+				$l_norm = ctype_digit($line_planning_number) ? strval(intval($line_planning_number)) : $line_planning_number;
 				$context = array(
 					'operator' => $operator,
-					'line_planning_number' => $line_planning_number,
-					'journey_number' => (string) $row['journey_number'],
+					'line_planning_number' => $l_norm,
+					'journey_number' => $j_norm,
+					'raw_line_planning_number' => $line_planning_number,
+					'raw_journey_number' => $journey_number,
 				);
 			}
 		}
@@ -1807,22 +1969,16 @@ class OV_Halte_Importer {
 		$context = self::get_realtime_journey_context($journey_ref);
 		if ($context !== null) {
 			$composite = $context['operator'] . ':' . $context['line_planning_number'] . ':' . $context['journey_number'];
-			return array_values(array_unique(array($composite, $journey_ref)));
-		}
-
-		// Geen lijncontext te bepalen (bv. journey_ref niet in de dienstregeling
-		// gevonden) - val terug op de oude, minder betrouwbare heuristiek zodat er
-		// tenminste nog een kans op een match is.
-		$variants = array($journey_ref);
-		if (strpos($journey_ref, ':') !== false) {
-			$parts = explode(':', $journey_ref);
-			$short_ref = trim((string) end($parts));
-			if ($short_ref !== '' && $short_ref !== $journey_ref) {
-				$variants[] = $short_ref;
+			$variants = array($composite, $journey_ref);
+			if ($context['raw_line_planning_number'] !== $context['line_planning_number'] || $context['raw_journey_number'] !== $context['journey_number']) {
+				$variants[] = $context['operator'] . ':' . $context['raw_line_planning_number'] . ':' . $context['raw_journey_number'];
 			}
+			return array_values(array_unique($variants));
 		}
 
-		return array_values(array_unique(array_filter($variants, 'strlen')));
+		// Geen lijncontext te bepalen: UITSLUITEND matchen op de letterlijke journey_ref zelf.
+		// Uitdrukkelijk GEEN fallback naar een kaal ritnummer.
+		return array($journey_ref);
 	}
 
 	private static function get_realtime_stop_code_variants($stop_code) {
@@ -2068,6 +2224,11 @@ class OV_Halte_Importer {
 						'quay_name' => $quay['quay_name'],
 						'latitude' => $quay['latitude'],
 						'longitude' => $quay['longitude'],
+						'wheelchair_access' => $quay['wheelchair_access'],
+						'step_free_access' => $quay['step_free_access'],
+						'shelter' => $quay['shelter'],
+						'bicycle_parking' => $quay['bicycle_parking'],
+						'toilet_available' => $quay['toilet_available'],
 					);
 					$quay_count++;
 				}
@@ -2078,7 +2239,7 @@ class OV_Halte_Importer {
     
     // Opslaan in database via bulk upsert
     self::bulk_upsert('stopplaces', array('stopplace_code', 'stopplace_name', 'town', 'latitude', 'longitude'), $stopplace_rows);
-    self::bulk_upsert('quays', array('quay_code', 'stopplace_code', 'quay_name', 'latitude', 'longitude', 'wheelchair_access', 'step_free_access'), $quay_rows);
+    self::bulk_upsert('quays', array('quay_code', 'stopplace_code', 'quay_name', 'latitude', 'longitude', 'wheelchair_access', 'step_free_access', 'shelter', 'bicycle_parking', 'toilet_available'), $quay_rows);
     
     return array(
         'stopplaces' => $stopplace_count,
@@ -2180,6 +2341,9 @@ class OV_Halte_Importer {
         'longitude' => 0.0,
         'wheelchair_access' => 'unknown',
         'step_free_access' => 'unknown',
+        'shelter' => 0,
+        'bicycle_parking' => 0,
+        'toilet_available' => 0,
     );
     $rd_x = 0.0;
     $rd_y = 0.0;
@@ -2211,6 +2375,12 @@ class OV_Halte_Importer {
             $data['wheelchair_access'] = trim($reader->readString());
         } elseif ($localName === 'stepfreeaccess') {
             $data['step_free_access'] = trim($reader->readString());
+        } elseif ($localName === 'shelter') {
+            $data['shelter'] = self::normalize_boolean_value($reader->readString()) ? 1 : 0;
+        } elseif ($localName === 'bicycleparking') {
+            $data['bicycle_parking'] = self::normalize_boolean_value($reader->readString()) ? 1 : 0;
+        } elseif (in_array($localName, array('toilet', 'toilets', 'toiletavailable', 'toiletfacility', 'publictoilet'), true)) {
+            $data['toilet_available'] = self::normalize_boolean_value($reader->readString()) ? 1 : 0;
         }
     }
 
@@ -2512,7 +2682,7 @@ class OV_Halte_Importer {
 		exit;
 	}
 
-	private static function get_realtime_delay_map(array $journey_refs, array $stop_codes) {
+	public static function get_realtime_delay_map(array $journey_refs, array $stop_codes) {
 		self::sync_remote_realtime_delays_if_needed();
 		global $wpdb;
 
@@ -2937,6 +3107,9 @@ private static function parse_assignment(XMLReader $reader) {
 						'longitude' => 0,
 						'wheelchair_access' => 'unknown',
 						'step_free_access' => 'unknown',
+						'shelter' => 0,
+						'bicycle_parking' => 0,
+						'toilet_available' => 0,
 					);
 				}
 			}
@@ -3129,7 +3302,7 @@ private static function parse_assignment(XMLReader $reader) {
 		if (!empty($quays)) {
 			self::bulk_upsert(
 				'quays',
-				array('quay_code', 'stopplace_code', 'quay_name', 'latitude', 'longitude', 'wheelchair_access', 'step_free_access'),
+				array('quay_code', 'stopplace_code', 'quay_name', 'latitude', 'longitude', 'wheelchair_access', 'step_free_access', 'shelter', 'bicycle_parking', 'toilet_available'),
 				array_values($quays)
 			);
 		}
@@ -4036,6 +4209,36 @@ private static function parse_assignment(XMLReader $reader) {
 		);
 		$scheduled_stop_refs = array_values(array_unique(array_filter($scheduled_stop_refs)));
 
+		// Haal perron/quay info op via scheduled_stops — exact dezelfde methode als Ovalino Map.
+		// stop_name bevat het perron als: "Haltenaam (Perron A)" terwijl stopplace_name alleen "Haltenaam" is.
+		$quays_data = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT q.quay_code, sp.stopplace_name, MAX(ss.stop_name) as stop_name
+				 FROM " . self::table('quays') . " q
+				 LEFT JOIN " . self::table('stopplaces') . " sp ON sp.stopplace_code = q.stopplace_code
+				 LEFT JOIN " . self::table('assignments') . " ass ON ass.quay_code = q.quay_code
+				 LEFT JOIN " . self::table('scheduled_stops') . " ss ON ss.scheduled_stop_point_ref = ass.scheduled_stop_point_ref
+				 WHERE q.quay_code IN ($placeholders)
+				 GROUP BY q.quay_code",
+				$quay_codes
+			),
+			ARRAY_A
+		);
+		$platform_by_quay = array();
+		if (!empty($quays_data)) {
+			foreach ($quays_data as $qd) {
+				$sp_name = isset($qd['stopplace_name']) ? trim($qd['stopplace_name']) : '';
+				$stop_name = isset($qd['stop_name']) ? trim($qd['stop_name']) : '';
+				// Alleen extractie als stop_name verschilt van stopplace_name — precies zoals Ovalino Map
+				if ($stop_name !== '' && strtolower($stop_name) !== strtolower($sp_name)) {
+					$plat = self::extract_platform_from_quay_name($stop_name, $sp_name);
+					if ($plat !== '') {
+						$platform_by_quay[$qd['quay_code']] = $plat;
+					}
+				}
+			}
+		}
+
 		$query = "
 			SELECT sl.quay_code, sl.line_ref, sl.direction_type, sl.destination, l.public_code, l.line_name, l.colour, l.text_colour, l.transport_mode
 			FROM " . self::table('stop_lines') . " sl
@@ -4056,6 +4259,7 @@ private static function parse_assignment(XMLReader $reader) {
 					'colour' => $row['colour'],
 					'text_colour' => $row['text_colour'],
 					'transport_mode' => isset($row['transport_mode']) ? $row['transport_mode'] : 'bus',
+					'quay_code' => $row['quay_code'],
 					'destinations' => array(),
 				);
 			}
@@ -4080,6 +4284,13 @@ private static function parse_assignment(XMLReader $reader) {
 				$item['direction_type'],
 				2
 			);
+			$platform = '';
+			if (isset($item['quay_code']) && !empty($platform_by_quay[$item['quay_code']])) {
+				$platform = $platform_by_quay[$item['quay_code']];
+			}
+			if ($platform !== '') {
+				$items[$key]['platform'] = $platform;
+			}
 			$is_boat = isset($item['transport_mode']) && $item['transport_mode'] === 'water';
 			if ($is_boat) {
 				// Bootdiensten (Ovalino Boot) tonen 'Veer' als badge in plaats van
@@ -4186,26 +4397,67 @@ private static function parse_assignment(XMLReader $reader) {
 			$text_color = self::resolve_text_colour($background, isset($item['text_colour']) ? $item['text_colour'] : '');
 			$destination = !empty($item['destination']) ? $item['destination'] : (isset($item['line_name']) ? $item['line_name'] : '');
 			$departure_text = !empty($item['departures']) ? ': ' . implode(' - ', $item['departures']) : '';
+			if (!empty($item['platform']) && !empty($item['departures']) && strpos($departure_text, 'ov-platform') === false) {
+				$plat_label = $item['platform'];
+				if (!preg_match('/^(?:perron|spoor)\b/i', $plat_label)) {
+					$plat_label = 'perron ' . $plat_label;
+				}
+				$departure_text .= ' <span class="ov-platform" style="color: #555; margin-left: 6px;">' . esc_html($plat_label) . '</span>';
+			}
 			$schedule_url = !empty($item['schedule_url']) ? $item['schedule_url'] : '';
-			$destination_html = wp_kses($destination, array(
-				'span'   => array('class' => array(), 'style' => array()),
+			$allowed_html = array(
+				'span'   => array('class' => array(), 'style' => array(), 'title' => array()),
 				'strong' => array(),
 				'em'     => array(),
 				's'      => array('style' => array()),
 				'br'     => array(),
-			));
+			);
+			$destination_html = wp_kses($destination, $allowed_html);
+			$departure_html = wp_kses($departure_text, $allowed_html);
 			?>
 			<div class="ovhi-item">
 				<a class="ovhi-badge" href="<?php echo esc_url($schedule_url); ?>" style="background-color: <?php echo esc_attr($background); ?>; color: <?php echo esc_attr($text_color); ?>;">
 					<?php echo esc_html($item['public_code']); ?>
 				</a>
 				<span class="ovhi-content">
-					<a class="ovhi-destination" href="<?php echo esc_url($schedule_url); ?>"><?php echo $destination_html . $departure_text; ?></a>
+					<a class="ovhi-destination" href="<?php echo esc_url($schedule_url); ?>"><?php echo $destination_html . $departure_html; ?></a>
 				</span>
 			</div>
 			<?php
 		}
 		return ob_get_clean();
+	}
+
+	/**
+	 * Extraheert de perronletter of -nummer uit een stop_name.
+	 * Gebruik dezelfde logica als Ovalino Map:
+	 * - "Haltenaam (Perron A)" → "A"
+	 * - "Haltenaam (Halte 3)" → "3"
+	 * - stop_name gelijk aan stopplace_name → ""
+	 *
+	 * @param string $stop_name      Bijv. "Station Dordrecht (Perron A)"
+	 * @param string $stopplace_name Bijv. "Station Dordrecht"
+	 * @return string Perronletter/-nummer, of lege string
+	 */
+	public static function extract_platform_from_quay_name($stop_name, $stopplace_name = '') {
+		$name = trim((string) $stop_name);
+		$stopplace_name = trim((string) $stopplace_name);
+		if ($name === '') {
+			return '';
+		}
+		// Als stop_name gelijk is aan stopplace_name, geen perron
+		if ($stopplace_name !== '' && strcasecmp($name, $stopplace_name) === 0) {
+			return '';
+		}
+		// Primair: exact zelfde patroon als Ovalino Map — "(Perron X)" of "(Halte X)" aan het einde
+		if (preg_match('/\(\s*(?:Perron|Halte|Spoor)\s+([^)]+)\)\s*$/i', $name, $matches)) {
+			return trim($matches[1]);
+		}
+		// Fallback: standalone "(A)" of "(C1)" achteraan
+		if (preg_match('/\(\s*([A-Za-z0-9]{1,4})\s*\)\s*$/', $name, $matches)) {
+			return trim($matches[1]);
+		}
+		return '';
 	}
 
 	public static function sort_line_items($a, $b) {
@@ -4274,7 +4526,7 @@ private static function parse_assignment(XMLReader $reader) {
 		$params[] = $window['end_date'];
 
 		$query = "
-			SELECT DISTINCT slp.destination_display, so.offset_seconds, j.journey_ref, j.departure_seconds, a.from_date, a.to_date, a.valid_day_bits
+			SELECT DISTINCT slp.destination_display, so.offset_seconds, j.journey_ref, j.journey_number, j.departure_seconds, a.from_date, a.to_date, a.valid_day_bits
 			FROM " . self::table('stop_line_patterns') . " slp
 			INNER JOIN " . self::table('assignments') . " ass ON ass.quay_code = slp.quay_code
 			INNER JOIN " . self::table('stop_offsets') . " so
@@ -4322,20 +4574,55 @@ private static function parse_assignment(XMLReader $reader) {
 			return $fallback;
 		}
 
-		// Filter duplicates: keep only the newest version of journeys with the same departure time at this stop
+		// Filter duplicates: keep only the newest version of journeys with the same departure time at this stop.
+		// Extra buses departing at the same minute with distinct journey numbers are preserved.
 		$groups = array();
 		foreach ($valid_rows as $row) {
 			$total_seconds = (int) $row['departure_seconds'] + (int) $row['offset_seconds'];
-			$groups[$total_seconds][] = $row;
+			$j_num = isset($row['journey_number']) ? trim((string) $row['journey_number']) : '';
+			if ($j_num === '' && !empty($row['journey_ref'])) {
+				$parts = explode(':', (string) $row['journey_ref']);
+				$last = end($parts);
+				$subparts = explode('-', $last);
+				if (count($subparts) >= 2) {
+					$j_num = $subparts[count($subparts) - 2];
+				}
+			}
+			$j_norm = ctype_digit($j_num) ? (string) (int) $j_num : $j_num;
+			$row['_j_norm'] = $j_norm;
+			$row['_total_seconds'] = $total_seconds;
+
+			$matched_group_idx = null;
+			foreach ($groups as $idx => $group) {
+				foreach ($group as $existing) {
+					$same_num = ($j_norm !== '' && $j_norm === $existing['_j_norm']);
+					$same_time = ($total_seconds === $existing['_total_seconds']);
+					$distinct_nums = ($j_norm !== '' && $existing['_j_norm'] !== '' && $j_norm !== $existing['_j_norm']);
+
+					if ($same_num || ($same_time && !$distinct_nums)) {
+						$matched_group_idx = $idx;
+						break 2;
+					}
+				}
+			}
+
+			if ($matched_group_idx !== null) {
+				$groups[$matched_group_idx][] = $row;
+			} else {
+				$groups[] = array($row);
+			}
 		}
+
 		$rows = array();
-		foreach ($groups as $total_seconds => $group) {
+		foreach ($groups as $group) {
 			if (count($group) > 1) {
 				usort($group, function ($a, $b) {
 					return strcmp($b['from_date'], $a['from_date']);
 				});
 			}
-			$rows[] = $group[0];
+			$selected = $group[0];
+			unset($selected['_j_norm'], $selected['_total_seconds']);
+			$rows[] = $selected;
 		}
 
 		$counts = array();
@@ -4463,7 +4750,7 @@ private static function parse_assignment(XMLReader $reader) {
 		$params[] = $window['end_date'];
 
 		$query = "
-			SELECT DISTINCT so.offset_seconds, j.departure_seconds, j.journey_ref, st.user_stop_code, ass.quay_code, a.from_date, a.to_date, a.valid_day_bits
+			SELECT DISTINCT so.offset_seconds, j.departure_seconds, j.journey_ref, j.journey_number, st.user_stop_code, ass.quay_code, a.from_date, a.to_date, a.valid_day_bits
 			FROM " . self::table('stop_offsets') . " so
 			INNER JOIN " . self::table('journeys') . " j
 				ON j.service_journey_pattern_ref = so.service_journey_pattern_ref
@@ -4529,6 +4816,7 @@ private static function parse_assignment(XMLReader $reader) {
 		$delay_map = self::get_realtime_delay_map($journey_refs, $stop_codes);
 
 		// Filter duplicates: keep only the newest version of journeys with the same departure time at this stop.
+		// Extra buses departing at the same minute with distinct journey numbers are preserved.
 		$groups = array();
 		foreach ($valid_rows as $row) {
 			$journey_ref = isset($row['journey_ref']) ? (string) $row['journey_ref'] : '';
@@ -4560,17 +4848,51 @@ private static function parse_assignment(XMLReader $reader) {
 			$row['is_cancelled'] = (is_array($delay) && !empty($delay['is_cancelled']));
 			$row['expected_time'] = (is_array($delay) && isset($delay['expected_time'])) ? $delay['expected_time'] : null;
 			$total_seconds = (int) $row['departure_seconds'] + (int) $row['offset_seconds'];
-			$groups[$total_seconds][] = $row;
+
+			$j_num = isset($row['journey_number']) ? trim((string) $row['journey_number']) : '';
+			if ($j_num === '' && !empty($journey_ref)) {
+				$parts = explode(':', $journey_ref);
+				$last = end($parts);
+				$subparts = explode('-', $last);
+				if (count($subparts) >= 2) {
+					$j_num = $subparts[count($subparts) - 2];
+				}
+			}
+			$j_norm = ctype_digit($j_num) ? (string) (int) $j_num : $j_num;
+			$row['_j_norm'] = $j_norm;
+			$row['_total_seconds'] = $total_seconds;
+
+			$matched_group_idx = null;
+			foreach ($groups as $idx => $group) {
+				foreach ($group as $existing) {
+					$same_num = ($j_norm !== '' && $j_norm === $existing['_j_norm']);
+					$same_time = ($total_seconds === $existing['_total_seconds']);
+					$distinct_nums = ($j_norm !== '' && $existing['_j_norm'] !== '' && $j_norm !== $existing['_j_norm']);
+
+					if ($same_num || ($same_time && !$distinct_nums)) {
+						$matched_group_idx = $idx;
+						break 2;
+					}
+				}
+			}
+
+			if ($matched_group_idx !== null) {
+				$groups[$matched_group_idx][] = $row;
+			} else {
+				$groups[] = array($row);
+			}
 		}
 
 		$rows = array();
-		foreach ($groups as $total_seconds => $group) {
+		foreach ($groups as $group) {
 			if (count($group) > 1) {
 				usort($group, function ($a, $b) {
 					return strcmp($b['from_date'], $a['from_date']);
 				});
 			}
-			$rows[] = $group[0];
+			$selected = $group[0];
+			unset($selected['_j_norm'], $selected['_total_seconds']);
+			$rows[] = $selected;
 		}
 
 		$candidates = array();

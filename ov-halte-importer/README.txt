@@ -21,6 +21,7 @@ Shortcodes
 Opmerkingen
 - De plugin verwijdert oude datasetbestanden volledig bij een nieuwe import.
 - Lijnkleuren en tekstkleuren worden uit NeTEx gebruikt als die aanwezig zijn.
+- De CHB-import slaat abri, fietsparkeren en rolstoeltoegankelijkheid per perron op voor Ovalino Map. Treinstations gebruiken het attribuut `TGST` uit `stationattributes.dat` en `attributesonstation.dat`. De meegeleverde CHB- en stationsbestanden bevatten geen toiletgegevens; een toileticoon verschijnt alleen wanneer een bronbestand die expliciet aanlevert.
 - Zonder lijnkleur gebruikt de plugin `#861121`.
 - Meerdere codes in een shortcode worden samengevoegd en dubbele regels worden verwijderd.
 - Elke lijn wordt op de frontend op een eigen regel getoond.

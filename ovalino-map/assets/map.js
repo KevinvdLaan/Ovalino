@@ -280,6 +280,23 @@ function createPopupContent(stop) {
         platformHtml = '<div style="color:#707070 !important; font-size:12px !important; margin-top:2px !important; margin-bottom:8px !important; font-family:\'Helvetica Neue\',Helvetica,Arial,sans-serif !important; font-weight:500 !important; display:block !important;">' + escapeHtml(platformVal) + '</div>';
     }
 
+    var facilityIcons = [
+        { key: 'has_shelter', label: 'Abri aanwezig', path: '<path d="M3 11.5 12 5l9 6.5M5.5 10.5V20h13v-9.5M9 20v-5h6v5"/>' },
+        { key: 'has_bicycle_parking', label: 'Fietsparkeren aanwezig', path: '<circle cx="6" cy="17" r="3"/><circle cx="18" cy="17" r="3"/><path d="m6 17 4-8 4 8H6Zm4-8h4m-1 0 5 8m-5-8-2 4"/>' },
+        { key: 'has_toilet', label: 'Toilet aanwezig', path: '<circle cx="8" cy="5" r="2"/><circle cx="16" cy="5" r="2"/><path d="M6 10h4l-1 4 2 6m5-10h2l2 8h-4l-1-5-2 7"/>' }
+    ];
+    var facilityIconsHtml = facilityIcons.filter(function(facility) {
+        return stop[facility.key] === true || stop[facility.key] === 1 || stop[facility.key] === '1';
+    }).map(function(facility) {
+        return '<span class="ovrp-facility-icon" role="img" aria-label="' + escapeHtml(facility.label) + '" title="' + escapeHtml(facility.label) + '">' +
+            '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">' + facility.path + '</svg></span>';
+    }).join('');
+
+    var wheelchairHtml = '<div class="ovrp-wheelchair-status">' +
+        '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="4" r="2"/><path d="M11 8h4l1 5h4M9 8l-2 7a6 6 0 1 0 10 5M12 10l-2 5h5"/></svg>' +
+        '<span>Rolstoeltoegankelijk: <strong>' + (stop.wheelchair_accessible ? 'Ja' : 'Nee') + '</strong></span></div>';
+    var facilitiesHtml = '<div class="ovrp-facilities">' + wheelchairHtml + facilityIconsHtml + '</div>';
+
     var lineMap = {};
     
     (stop.lines || []).forEach(function(line) {
@@ -427,6 +444,7 @@ function createPopupContent(stop) {
     return '<div style="font-size:14px;min-width:220px;font-family:\'circularstd-bold\', sans-serif;">' +
             '<strong style="color:#861121;font-size:14px;font-family:\'circularstd-bold\', sans-serif;display:block;margin-bottom:2px;">' + escapeHtml(stop.name) + '</strong>' +
             platformHtml +
+            facilitiesHtml +
             linesHtml +
             departuresHtml +
             departuresUrlHtml +

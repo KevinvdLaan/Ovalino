@@ -156,6 +156,36 @@
     font-weight: 500 !important;
 }
 
+.ovrp-facilities {
+	display: flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin: 4px 0 8px;
+	color: #861121;
+	font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+	font-size: 12px;
+}
+
+.ovrp-wheelchair-status,
+.ovrp-facility-icon {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+}
+
+.ovrp-wheelchair-status svg,
+.ovrp-facility-icon svg {
+	width: 19px;
+	height: 19px;
+	flex: 0 0 auto;
+	fill: none;
+	stroke: currentColor;
+	stroke-width: 1.8;
+	stroke-linecap: round;
+	stroke-linejoin: round;
+}
+
 /* Responsive adjustments */
 @media screen and (max-width: 768px) {
 	#ovrp-map {
